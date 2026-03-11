@@ -1,0 +1,34 @@
+{
+  "name": "pi-squad-loader",
+  "version": "1.0.0",
+  "description": "GSD-PI extension that loads Squads ecosystem agents as native Pi SDK subagents, enabling squad workflows within autonomous GSD execution.",
+  "author": "gutomec",
+  "license": "MIT",
+  "type": "module",
+  "keywords": ["pi-package", "pi-extension", "squads", "multi-agent", "gsd-pi"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gutomec/pi-squad-loader"
+  },
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
+  "files": [
+    "extensions/",
+    "lib/",
+    "skills/",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "dependencies": {
+    "gray-matter": "^4.0.3",
+    "js-yaml": "^4.1.0",
+    "glob": "^10.3.0"
+  }
+}
