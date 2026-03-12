@@ -25,25 +25,109 @@ Transforms squad agents (`.md` with YAML frontmatter) into Pi SDK subagents, ena
                                   └─────────────────────────┘
 ```
 
+## Prerequisites
+
+- **Node.js** >= 20.6.0
+- **GSD-PI** installed globally (`npm install -g gsd-pi`)
+- **Anthropic account** with Pro/Max subscription (for OAuth login)
+
 ## Installation
 
-### Via Pi package manager (recommended)
+### Quick install (one command)
 
 ```bash
-pi install npm:pi-squad-loader
+git clone https://github.com/gutomec/pi-squad-loader.git ~/.gsd/extensions/pi-squad-loader && \
+cd ~/.gsd/extensions/pi-squad-loader && npm install
 ```
 
-### Via git
+### Step by step
+
+#### 1. Install GSD-PI (if you haven't)
 
 ```bash
-pi install git:github.com/gutomec/pi-squad-loader@v1
+npm install -g gsd-pi
 ```
 
-### Via settings.json (local development)
+Verify:
+
+```bash
+gsd --version
+# → GSD v0.2.x
+```
+
+#### 2. Login to GSD-PI (first time only)
+
+```bash
+gsd
+# Inside the GSD interactive shell:
+/login
+# Select "Anthropic" OAuth provider
+# Follow the browser login flow
+```
+
+#### 3. Clone and install Squad Loader
+
+```bash
+git clone https://github.com/gutomec/pi-squad-loader.git ~/.gsd/extensions/pi-squad-loader
+cd ~/.gsd/extensions/pi-squad-loader
+npm install
+```
+
+#### 4. Register the extension
+
+Edit (or create) `~/.gsd/agent/settings.json`:
 
 ```json
 {
-  "extensions": ["/path/to/pi-squad-loader/extensions/index.ts"]
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-sonnet-4-6",
+  "extensions": ["~/.gsd/extensions/pi-squad-loader/extensions/index.ts"]
+}
+```
+
+If the file already exists, just add the `"extensions"` field.
+
+#### 5. Add squads to ~/squads/
+
+The Squad Loader discovers squads in `~/squads/`. Each squad needs a `squad.yaml` manifest.
+
+```bash
+mkdir -p ~/squads
+
+# Clone any squad you want to use:
+git clone https://github.com/your-org/your-squad.git ~/squads/your-squad
+```
+
+Squad structure:
+
+```
+~/squads/your-squad/
+├── squad.yaml          # Manifest (name, description, agents, workflows)
+├── agents/
+│   ├── agent-one.md    # Agent definition (YAML frontmatter + instructions)
+│   └── agent-two.md
+├── tasks/
+│   └── task-one.md
+└── workflows/
+    └── main.yaml
+```
+
+#### 6. Verify installation
+
+```bash
+gsd
+# Inside GSD:
+/squad list       # → Should show your squads
+/squad status     # → Shows active squads and agents
+```
+
+### Alternative: Local development mode
+
+If you cloned the repo elsewhere, point settings.json to it:
+
+```json
+{
+  "extensions": ["/absolute/path/to/pi-squad-loader/extensions/index.ts"]
 }
 ```
 
@@ -83,16 +167,18 @@ pi install git:github.com/gutomec/pi-squad-loader@v1
 
 ### Example: Building a Landing Page
 
-```
+```bash
 # 1. Activate design + marketing squads
 /squad activate brandcraft
 /squad activate sales-funnel-masters
 
 # 2. Extract design system
-squad_dispatch "squad--brandcraft--bc-extractor" "Analyze https://example.com and extract design tokens"
+squad_dispatch "squad--brandcraft--bc-extractor" \
+  "Analyze https://example.com and extract design tokens"
 
 # 3. Get offer strategy
-squad_dispatch "squad--sales-funnel-masters--sfm-hormozi" "Create Grand Slam Offer for SaaS targeting developers"
+squad_dispatch "squad--sales-funnel-masters--sfm-hormozi" \
+  "Create Grand Slam Offer for SaaS targeting developers"
 
 # 4. Inject artifacts into GSD context
 squad_inject "design-tokens.md" research
@@ -101,6 +187,16 @@ squad_inject "offer-stack.md" research
 # 5. GSD auto picks up enriched context
 /gsd auto
 ```
+
+### Artifact Injection Targets
+
+Squad artifacts can be injected into three places:
+
+| Type | Target | Used by |
+|------|--------|---------|
+| `research` | `.gsd/milestones/M001/research/` | GSD planning phase |
+| `decision` | `.gsd/DECISIONS.md` (append) | Decision log |
+| `context` | `.gsd/squad-context/` | Next agent's system prompt |
 
 ## Agent Naming Convention
 
@@ -120,11 +216,21 @@ Examples:
 | `lib/agent-adapter.ts` | Converts squad agents to Pi SDK format |
 | `skills/squad-loader/SKILL.md` | Skill discovery for the LLM |
 
-## Requirements
+## Troubleshooting
 
-- GSD-PI (`npm install -g gsd-pi`)
-- Node.js >= 20.6.0
-- Squads in `~/squads/` with valid `squad.yaml`
+### `/squad list` shows nothing
+- Check that `~/squads/` exists and contains directories with `squad.yaml`
+- Run `ls ~/squads/*/squad.yaml` to verify
+
+### Extension not loading
+- Verify the path in `~/.gsd/agent/settings.json` is correct
+- Check that `npm install` was run inside the extension directory
+- Restart GSD (`gsd`) after changing settings.json
+
+### Login issues
+- GSD-PI uses OAuth (Pro/Max subscription), not API keys
+- Run `/login` inside GSD interactive mode
+- Select "Anthropic" as the provider
 
 ## License
 
