@@ -80,15 +80,29 @@ export interface ParsedSquad {
 // ─── Helpers ─────────────────────────────────────────────────
 
 function parseYamlFrontmatter(content: string): { data: Record<string, any>; body: string } {
-  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
-  if (!match) return { data: {}, body: content };
-
-  try {
-    const data = (yaml.load(match[1]) as Record<string, any>) || {};
-    return { data, body: match[2] };
-  } catch {
-    return { data: {}, body: match[2] || content };
+  // Format 1: Standard YAML frontmatter (---\n...\n---)
+  const stdMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  if (stdMatch) {
+    try {
+      const data = (yaml.load(stdMatch[1]) as Record<string, any>) || {};
+      return { data, body: stdMatch[2] };
+    } catch {
+      return { data: {}, body: stdMatch[2] || content };
+    }
   }
+
+  // Format 2: AIOS-style ```yaml code block (used by most squad agent files)
+  const aiosMatch = content.match(/^```ya?ml\r?\n([\s\S]*?)\r?\n```\r?\n?([\s\S]*)$/);
+  if (aiosMatch) {
+    try {
+      const data = (yaml.load(aiosMatch[1]) as Record<string, any>) || {};
+      return { data, body: aiosMatch[2] };
+    } catch {
+      return { data: {}, body: aiosMatch[2] || content };
+    }
+  }
+
+  return { data: {}, body: content };
 }
 
 function parseYamlFile(content: string): Record<string, any> {

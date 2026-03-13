@@ -297,25 +297,38 @@ export default function squadLoader(pi: ExtensionAPI) {
         taskPrompt = `## Context from previous agent\n${params.context}\n\n## Your Task\n${params.task}`;
       }
 
-      // Read agent file to extract model and tools
+      // Read agent file to extract model, tools, and system prompt.
+      // Uses proper frontmatter parsing (matching subagent extension's approach).
       let agentModel: string | undefined;
       let agentTools: string[] = [];
       let agentSystemPrompt = "";
       try {
         const agentContent = readFileSync(agentPath, "utf8");
-        const fmMatch = agentContent.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+        const fmMatch = agentContent.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
         if (fmMatch) {
-          const fmLines = fmMatch[1].split("\n");
+          const fmBlock = fmMatch[1];
           agentSystemPrompt = fmMatch[2];
-          for (const line of fmLines) {
-            const modelMatch = line.match(/^model:\s*(.+)$/);
-            if (modelMatch) agentModel = modelMatch[1].trim();
-            const toolsMatch = line.match(/^tools:\s*(.+)$/);
-            if (toolsMatch) agentTools = toolsMatch[1].split(",").map((t: string) => t.trim()).filter(Boolean);
+          // Parse YAML frontmatter properly (handles multi-line values)
+          try {
+            const parsed = (await import("js-yaml")).default.load(fmBlock) as Record<string, any>;
+            if (parsed) {
+              if (parsed.model) agentModel = String(parsed.model);
+              if (parsed.tools) {
+                agentTools = String(parsed.tools).split(",").map((t: string) => t.trim()).filter(Boolean);
+              }
+            }
+          } catch {
+            // Fallback: line-by-line regex
+            for (const line of fmBlock.split("\n")) {
+              const modelMatch = line.match(/^model:\s*(.+)$/);
+              if (modelMatch) agentModel = modelMatch[1].trim();
+              const toolsMatch = line.match(/^tools:\s*(.+)$/);
+              if (toolsMatch) agentTools = toolsMatch[1].split(",").map((t: string) => t.trim()).filter(Boolean);
+            }
           }
         }
       } catch {
-        // fallback: dispatch anyway
+        // fallback: dispatch anyway with defaults
       }
 
       onUpdate?.({
@@ -323,7 +336,8 @@ export default function squadLoader(pi: ExtensionAPI) {
         details: { agent: params.agent, task: params.task },
       });
 
-      // Directly spawn the subagent process (same mechanism as subagent extension)
+      // Spawn the subagent process — using the same pattern as the working `subagent` extension.
+      // Key: pass ALL bundled extensions (do NOT filter), proper JSON event tracking.
       const output = await new Promise<string>((resolve) => {
         const args: string[] = ["--mode", "json", "-p", "--no-session"];
         if (agentModel) args.push("--model", agentModel);
@@ -341,11 +355,10 @@ export default function squadLoader(pi: ExtensionAPI) {
 
         args.push(`Task: ${taskPrompt}`);
 
-        // Use only essential extensions for squad agents (no Playwright, no mac-tools)
-        const allPaths = (process.env.GSD_BUNDLED_EXTENSION_PATHS ?? "").split(":").filter(Boolean);
-        const heavyExtensions = ["browser-tools", "mac-tools", "bg-shell", "slash-commands", "ask-user-questions", "get-secrets-from-user"];
-        const slimPaths = allPaths.filter(p => !heavyExtensions.some(h => p.includes(h)));
-        const extensionArgs = slimPaths.flatMap(p => ["--extension", p]);
+        // Pass ALL bundled extensions — same as the subagent extension.
+        // Filtering caused silent failures when needed extensions were missing.
+        const bundledPaths = (process.env.GSD_BUNDLED_EXTENSION_PATHS ?? "").split(":").filter(Boolean);
+        const extensionArgs = bundledPaths.flatMap(p => ["--extension", p]);
 
         const proc = spawn(
           process.execPath,
@@ -356,54 +369,67 @@ export default function squadLoader(pi: ExtensionAPI) {
         let buffer = "";
         let finalOutput = "";
         let stderr = "";
+        let turns = 0;
+
+        const processLine = (line: string) => {
+          if (!line.trim()) return;
+          let event: any;
+          try { event = JSON.parse(line); } catch { return; }
+
+          // Track message_end events (same pattern as subagent extension)
+          if (event.type === "message_end" && event.message) {
+            const msg = event.message;
+            if (msg.role === "assistant") {
+              turns++;
+              for (const part of msg.content ?? []) {
+                if (part.type === "text") {
+                  finalOutput = part.text;
+                  onUpdate?.({
+                    content: [{ type: "text", text: finalOutput }],
+                    details: { agent: params.agent, task: params.task, turns },
+                  });
+                }
+              }
+            }
+          }
+        };
 
         proc.stdout.on("data", (data: Buffer) => {
           buffer += data.toString();
           const lines = buffer.split("\n");
           buffer = lines.pop() || "";
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-              const event = JSON.parse(line);
-              if (event.type === "message_end" && event.message?.role === "assistant") {
-                for (const part of event.message.content ?? []) {
-                  if (part.type === "text") {
-                    finalOutput = part.text;
-                    onUpdate?.({
-                      content: [{ type: "text", text: finalOutput || "(running...)" }],
-                      details: { agent: params.agent, task: params.task },
-                    });
-                  }
-                }
-              }
-            } catch { /* skip non-JSON */ }
-          }
+          for (const line of lines) processLine(line);
         });
 
         proc.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
 
-        proc.on("close", () => {
-          if (buffer.trim()) {
-            try {
-              const event = JSON.parse(buffer);
-              if (event.type === "message_end" && event.message?.role === "assistant") {
-                for (const part of event.message.content ?? []) {
-                  if (part.type === "text") finalOutput = part.text;
-                }
-              }
-            } catch { /* ignore */ }
-          }
+        proc.on("close", (code) => {
+          // Process remaining buffer
+          if (buffer.trim()) processLine(buffer);
+
           // Cleanup temp files
           try { if (tmpPath) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
           try { if (tmpDir) fs.rmdirSync(tmpDir); } catch { /* ignore */ }
-          resolve(finalOutput || stderr || "(no output)");
+
+          // Structured error reporting when spawn fails
+          if (!finalOutput) {
+            if (code !== 0) {
+              resolve(`[squad-dispatch] Agent exited with code ${code}.\n${stderr ? `stderr: ${stderr.trim()}` : "(no stderr)"}`);
+            } else if (turns === 0) {
+              resolve(`[squad-dispatch] Agent produced no output (0 turns). This usually means the agent file is malformed or auth failed.\n${stderr ? `stderr: ${stderr.trim()}` : ""}`);
+            } else {
+              resolve("(no text output from agent)");
+            }
+          } else {
+            resolve(finalOutput);
+          }
         });
 
-        proc.on("error", () => resolve("(spawn error)"));
+        proc.on("error", (err) => resolve(`[squad-dispatch] Spawn error: ${err.message}`));
 
         // Honor abort signal
         if (signal) {
-          const kill = () => { proc.kill("SIGTERM"); setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 3000); };
+          const kill = () => { proc.kill("SIGTERM"); setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000); };
           if (signal.aborted) kill();
           else signal.addEventListener("abort", kill, { once: true });
         }
@@ -478,25 +504,33 @@ export default function squadLoader(pi: ExtensionAPI) {
       // Inject initial context into first step
       chain[0].task = `## Initial Context\n${params.context}\n\n## Task\n${chain[0].task}`;
 
-      // Helper: spawn one agent directly (same as squad_dispatch)
+      // Helper: spawn one agent directly (matches subagent extension pattern)
       const spawnAgent = async (agentName: string, taskPrompt: string): Promise<string> => {
         const agentPath = join(state.agentsCacheDir, `${agentName}.md`);
-        if (!existsSync(agentPath)) return `(agent ${agentName} not found)`;
+        if (!existsSync(agentPath)) return `[squad-workflow] Agent ${agentName} not found in cache.`;
 
         let agentModel: string | undefined;
         let agentTools: string[] = [];
         let agentSystemPrompt = "";
         try {
           const agentContent = readFileSync(agentPath, "utf8");
-          const fmMatch = agentContent.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+          const fmMatch = agentContent.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
           if (fmMatch) {
-            const fmLines = fmMatch[1].split("\n");
+            const fmBlock = fmMatch[1];
             agentSystemPrompt = fmMatch[2];
-            for (const line of fmLines) {
-              const modelMatch = line.match(/^model:\s*(.+)$/);
-              if (modelMatch) agentModel = modelMatch[1].trim();
-              const toolsMatch = line.match(/^tools:\s*(.+)$/);
-              if (toolsMatch) agentTools = toolsMatch[1].split(",").map((t: string) => t.trim()).filter(Boolean);
+            try {
+              const parsed = (await import("js-yaml")).default.load(fmBlock) as Record<string, any>;
+              if (parsed) {
+                if (parsed.model) agentModel = String(parsed.model);
+                if (parsed.tools) agentTools = String(parsed.tools).split(",").map((t: string) => t.trim()).filter(Boolean);
+              }
+            } catch {
+              for (const line of fmBlock.split("\n")) {
+                const modelMatch = line.match(/^model:\s*(.+)$/);
+                if (modelMatch) agentModel = modelMatch[1].trim();
+                const toolsMatch = line.match(/^tools:\s*(.+)$/);
+                if (toolsMatch) agentTools = toolsMatch[1].split(",").map((t: string) => t.trim()).filter(Boolean);
+              }
             }
           }
         } catch { /* ignore */ }
@@ -517,10 +551,9 @@ export default function squadLoader(pi: ExtensionAPI) {
 
           args.push(`Task: ${taskPrompt}`);
 
-          const allPaths = (process.env.GSD_BUNDLED_EXTENSION_PATHS ?? "").split(":").filter(Boolean);
-          const heavyExtensions = ["browser-tools", "mac-tools", "bg-shell", "slash-commands", "ask-user-questions", "get-secrets-from-user"];
-          const slimPaths = allPaths.filter(p => !heavyExtensions.some(h => p.includes(h)));
-          const extensionArgs = slimPaths.flatMap(p => ["--extension", p]);
+          // Pass ALL bundled extensions — no filtering
+          const bundledPaths = (process.env.GSD_BUNDLED_EXTENSION_PATHS ?? "").split(":").filter(Boolean);
+          const extensionArgs = bundledPaths.flatMap(p => ["--extension", p]);
 
           const proc = spawn(
             process.execPath,
@@ -530,34 +563,48 @@ export default function squadLoader(pi: ExtensionAPI) {
 
           let buffer = "";
           let finalOutput = "";
+          let stderr = "";
+          let turns = 0;
+
+          const processLine = (line: string) => {
+            if (!line.trim()) return;
+            let event: any;
+            try { event = JSON.parse(line); } catch { return; }
+            if (event.type === "message_end" && event.message?.role === "assistant") {
+              turns++;
+              for (const part of event.message.content ?? []) {
+                if (part.type === "text") finalOutput = part.text;
+              }
+            }
+          };
 
           proc.stdout.on("data", (data: Buffer) => {
             buffer += data.toString();
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
-            for (const line of lines) {
-              if (!line.trim()) continue;
-              try {
-                const event = JSON.parse(line);
-                if (event.type === "message_end" && event.message?.role === "assistant") {
-                  for (const part of event.message.content ?? []) {
-                    if (part.type === "text") finalOutput = part.text;
-                  }
-                }
-              } catch { /* skip */ }
+            for (const line of lines) processLine(line);
+          });
+
+          proc.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
+
+          proc.on("close", (code) => {
+            if (buffer.trim()) processLine(buffer);
+            try { if (tmpPath) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+            try { if (tmpDir) fs.rmdirSync(tmpDir); } catch { /* ignore */ }
+
+            if (!finalOutput) {
+              if (code !== 0) resolve(`[squad-workflow] Agent ${agentName} exited with code ${code}.\n${stderr ? stderr.trim() : "(no stderr)"}`);
+              else if (turns === 0) resolve(`[squad-workflow] Agent ${agentName} produced no output (0 turns).\n${stderr ? stderr.trim() : ""}`);
+              else resolve("(no text output)");
+            } else {
+              resolve(finalOutput);
             }
           });
 
-          proc.on("close", () => {
-            try { if (tmpPath) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
-            try { if (tmpDir) fs.rmdirSync(tmpDir); } catch { /* ignore */ }
-            resolve(finalOutput || "(no output)");
-          });
-
-          proc.on("error", () => resolve("(spawn error)"));
+          proc.on("error", (err) => resolve(`[squad-workflow] Spawn error for ${agentName}: ${err.message}`));
 
           if (signal) {
-            const kill = () => { proc.kill("SIGTERM"); setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 3000); };
+            const kill = () => { proc.kill("SIGTERM"); setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000); };
             if (signal.aborted) kill();
             else signal.addEventListener("abort", kill, { once: true });
           }

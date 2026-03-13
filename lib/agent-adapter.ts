@@ -139,40 +139,47 @@ export function adaptAgent(agent: SquadAgent, tasks: SquadTask[]): PiAgentFile {
 
 /**
  * Builds the system prompt for a Pi subagent from squad agent data.
+ *
+ * The prompt must give the agent a clear identity, operational instructions,
+ * and enough context to execute the task it receives. The task itself comes
+ * from the dispatch call — the system prompt sets up WHO the agent is and
+ * HOW it should work, not WHAT specific task to do.
  */
 function buildSystemPrompt(agent: SquadAgent, tasks: SquadTask[]): string {
   const sections: string[] = [];
 
-  // Identity
-  sections.push(`# ${agent.icon} ${agent.name} — ${agent.title}`);
-  sections.push("");
-  sections.push(`**Squad:** ${agent.squadName}`);
-  sections.push(`**Role:** ${agent.role}`);
-  sections.push(`**Style:** ${agent.style}`);
+  // ── Identity ──────────────────────────────────────────
+  const nameDisplay = [agent.icon, agent.name, agent.title].filter(Boolean).join(" — ") || agent.id;
+  sections.push(`# ${nameDisplay}`);
   sections.push("");
 
-  if (agent.identity) {
-    sections.push(`## Identity`);
-    sections.push(agent.identity);
-    sections.push("");
+  if (agent.role) {
+    sections.push(`You are a **${agent.role}** from the "${agent.squadName}" squad.`);
+  } else {
+    sections.push(`You are a specialist agent from the "${agent.squadName}" squad.`);
   }
 
+  if (agent.identity) sections.push(agent.identity);
+  if (agent.style) sections.push(`Communication style: ${agent.style}`);
+  sections.push("");
+
+  // ── Focus Area ────────────────────────────────────────
   if (agent.focus) {
-    sections.push(`## Focus`);
+    sections.push("## Focus");
     sections.push(agent.focus);
     sections.push("");
   }
 
-  // Core principles
+  // ── Core Principles ───────────────────────────────────
   if (agent.corePrinciples.length > 0) {
-    sections.push("## Core Principles (Non-Negotiable)");
+    sections.push("## Principles (Non-Negotiable)");
     for (const p of agent.corePrinciples) {
       sections.push(`- ${p}`);
     }
     sections.push("");
   }
 
-  // Responsibility boundaries
+  // ── Boundaries ────────────────────────────────────────
   if (agent.responsibilityBoundaries.length > 0) {
     sections.push("## Responsibility Boundaries");
     for (const b of agent.responsibilityBoundaries) {
@@ -181,71 +188,64 @@ function buildSystemPrompt(agent: SquadAgent, tasks: SquadTask[]): string {
     sections.push("");
   }
 
-  // Commands as capabilities
-  if (agent.commands.length > 0) {
-    sections.push("## Capabilities");
-    sections.push("");
-    sections.push("When dispatched, you can perform these operations:");
-    sections.push("");
-    for (const cmd of agent.commands) {
-      const argsStr =
-        cmd.args.length > 0
-          ? ` (${cmd.args.map((a) => `${a.name}: ${a.description}`).join(", ")})`
-          : "";
-      sections.push(`- **${cmd.name}**${argsStr}: ${cmd.description}`);
-    }
-    sections.push("");
-  }
+  // ── Operational Instructions ──────────────────────────
+  sections.push("## How to Execute");
+  sections.push("");
+  sections.push("When you receive a task:");
+  sections.push("1. Read the referenced files and paths from the task description");
+  sections.push("2. Use your tools (read, bash, grep, write, edit) to analyze the codebase");
+  sections.push("3. Produce your findings as structured markdown");
+  sections.push("4. Be specific: include file paths, line numbers, code evidence, and severity");
+  sections.push("5. End with clear, actionable recommendations");
+  sections.push("");
 
-  // Tasks as detailed instructions
+  // ── Task Knowledge ────────────────────────────────────
+  // Only include task specs that belong to this agent
   if (tasks.length > 0) {
     sections.push("## Task Specifications");
     sections.push("");
     for (const task of tasks) {
       sections.push(`### ${task.name}`);
-      if (task.entrada.length > 0) {
-        sections.push("**Inputs:**");
-        for (const e of task.entrada) {
-          sections.push(`- \`${e.nome}\` (${e.tipo}): ${e.descricao}`);
-        }
-      }
       if (task.saida.length > 0) {
-        sections.push("**Outputs:**");
+        sections.push("**Expected outputs:**");
         for (const s of task.saida) {
           sections.push(`- \`${s.nome}\` (${s.tipo}): ${s.descricao}`);
         }
       }
       if (task.postConditions.length > 0) {
-        sections.push("**Success Criteria:**");
+        sections.push("**Success criteria:**");
         for (const c of task.postConditions) {
           sections.push(`- ${c}`);
         }
       }
-      sections.push("");
-      // Include task body (detailed instructions)
       if (task.content.trim()) {
-        sections.push(task.content.trim());
         sections.push("");
+        sections.push(task.content.trim());
       }
+      sections.push("");
     }
   }
 
-  // Include original markdown body (collaboration patterns, anti-patterns, etc.)
+  // ── Additional Context from agent body ────────────────
+  // Only include if it has substantive content (not just YAML repasted)
   if (agent.fullContent.trim()) {
-    sections.push("## Additional Context");
-    sections.push("");
-    sections.push(agent.fullContent.trim());
-    sections.push("");
+    const body = agent.fullContent.trim();
+    // Skip if body is just a YAML dump or too short to be useful
+    if (body.length > 50 && !body.startsWith("agent:") && !body.startsWith("persona:")) {
+      sections.push("## Additional Context");
+      sections.push("");
+      sections.push(body);
+      sections.push("");
+    }
   }
 
-  // Output format instruction
+  // ── Output Format ─────────────────────────────────────
   sections.push("## Output Format");
   sections.push("");
-  sections.push("Return your results as structured markdown. Include:");
-  sections.push("1. A brief summary of what was produced");
-  sections.push("2. The main artifact content");
-  sections.push("3. Any decisions made with rationale");
-  sections.push("4. Handoff notes for the next agent (if applicable)");
+  sections.push("Return your results as structured markdown:");
+  sections.push("1. **Summary** — what was analyzed and key findings count");
+  sections.push("2. **Findings** — each with severity, location (file:line), evidence, and fix");
+  sections.push("3. **Recommendations** — prioritized actionable next steps");
 
   return sections.join("\n");
 }
