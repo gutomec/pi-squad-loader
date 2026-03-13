@@ -25,6 +25,9 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join, resolve } from "path";
+import { spawn } from "node:child_process";
+import * as os from "node:os";
+import * as fs from "node:fs";
 import {
   discoverSquads,
   parseFullSquad,
@@ -244,25 +247,120 @@ export default function squadLoader(pi: ExtensionAPI) {
         taskPrompt = `## Context from previous agent\n${params.context}\n\n## Your Task\n${params.task}`;
       }
 
-      // Use pi.sendUserMessage to trigger subagent dispatch
-      // The LLM will use the subagent tool with this agent
-      const instruction = [
-        `Use the subagent tool to dispatch agent "${params.agent}" with the following task:`,
-        "",
-        taskPrompt,
-        "",
-        "Return the agent's full output.",
-      ].join("\n");
+      // Read agent file to extract model and tools
+      let agentModel: string | undefined;
+      let agentTools: string[] = [];
+      let agentSystemPrompt = "";
+      try {
+        const agentContent = readFileSync(agentPath, "utf8");
+        const fmMatch = agentContent.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+        if (fmMatch) {
+          const fmLines = fmMatch[1].split("\n");
+          agentSystemPrompt = fmMatch[2];
+          for (const line of fmLines) {
+            const modelMatch = line.match(/^model:\s*(.+)$/);
+            if (modelMatch) agentModel = modelMatch[1].trim();
+            const toolsMatch = line.match(/^tools:\s*(.+)$/);
+            if (toolsMatch) agentTools = toolsMatch[1].split(",").map((t: string) => t.trim()).filter(Boolean);
+          }
+        }
+      } catch {
+        // fallback: dispatch anyway
+      }
 
-      pi.sendUserMessage(instruction, { mode: "followUp" });
+      onUpdate?.({
+        content: [{ type: "text", text: `Dispatching ${params.agent}...` }],
+        details: { agent: params.agent, task: params.task },
+      });
+
+      // Directly spawn the subagent process (same mechanism as subagent extension)
+      const output = await new Promise<string>((resolve) => {
+        const args: string[] = ["--mode", "json", "-p", "--no-session"];
+        if (agentModel) args.push("--model", agentModel);
+        if (agentTools.length > 0) args.push("--tools", agentTools.join(","));
+
+        // Write system prompt to temp file
+        let tmpDir: string | null = null;
+        let tmpPath: string | null = null;
+        if (agentSystemPrompt.trim()) {
+          tmpDir = fs.mkdtempSync(join(os.tmpdir(), "squad-dispatch-"));
+          tmpPath = join(tmpDir, `${params.agent}.md`);
+          fs.writeFileSync(tmpPath, agentSystemPrompt, { encoding: "utf-8", mode: 0o600 });
+          args.push("--append-system-prompt", tmpPath);
+        }
+
+        args.push(`Task: ${taskPrompt}`);
+
+        // Use only essential extensions for squad agents (no Playwright, no mac-tools)
+        const allPaths = (process.env.GSD_BUNDLED_EXTENSION_PATHS ?? "").split(":").filter(Boolean);
+        const heavyExtensions = ["browser-tools", "mac-tools", "bg-shell", "slash-commands", "ask-user-questions", "get-secrets-from-user"];
+        const slimPaths = allPaths.filter(p => !heavyExtensions.some(h => p.includes(h)));
+        const extensionArgs = slimPaths.flatMap(p => ["--extension", p]);
+
+        const proc = spawn(
+          process.execPath,
+          [process.env.GSD_BIN_PATH!, ...extensionArgs, ...args],
+          { cwd: ctx.cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] }
+        );
+
+        let buffer = "";
+        let finalOutput = "";
+        let stderr = "";
+
+        proc.stdout.on("data", (data: Buffer) => {
+          buffer += data.toString();
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const event = JSON.parse(line);
+              if (event.type === "message_end" && event.message?.role === "assistant") {
+                for (const part of event.message.content ?? []) {
+                  if (part.type === "text") {
+                    finalOutput = part.text;
+                    onUpdate?.({
+                      content: [{ type: "text", text: finalOutput || "(running...)" }],
+                      details: { agent: params.agent, task: params.task },
+                    });
+                  }
+                }
+              }
+            } catch { /* skip non-JSON */ }
+          }
+        });
+
+        proc.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
+
+        proc.on("close", () => {
+          if (buffer.trim()) {
+            try {
+              const event = JSON.parse(buffer);
+              if (event.type === "message_end" && event.message?.role === "assistant") {
+                for (const part of event.message.content ?? []) {
+                  if (part.type === "text") finalOutput = part.text;
+                }
+              }
+            } catch { /* ignore */ }
+          }
+          // Cleanup temp files
+          try { if (tmpPath) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+          try { if (tmpDir) fs.rmdirSync(tmpDir); } catch { /* ignore */ }
+          resolve(finalOutput || stderr || "(no output)");
+        });
+
+        proc.on("error", () => resolve("(spawn error)"));
+
+        // Honor abort signal
+        if (signal) {
+          const kill = () => { proc.kill("SIGTERM"); setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 3000); };
+          if (signal.aborted) kill();
+          else signal.addEventListener("abort", kill, { once: true });
+        }
+      });
 
       return {
-        content: [
-          {
-            type: "text",
-            text: `Dispatching ${params.agent}... The subagent will execute in an isolated context.`,
-          },
-        ],
+        content: [{ type: "text", text: output }],
         details: { agent: params.agent, task: params.task },
       };
     },
@@ -327,36 +425,116 @@ export default function squadLoader(pi: ExtensionAPI) {
       // Inject initial context into first step
       chain[0].task = `## Initial Context\n${params.context}\n\n## Task\n${chain[0].task}`;
 
-      // Build the chain dispatch instruction
-      const chainDescription = chain
-        .map(
-          (step, i) =>
-            `Step ${i + 1}: ${step.agent} — ${step.task.slice(0, 80)}...`
-        )
-        .join("\n");
+      // Helper: spawn one agent directly (same as squad_dispatch)
+      const spawnAgent = async (agentName: string, taskPrompt: string): Promise<string> => {
+        const agentPath = join(state.agentsCacheDir, `${agentName}.md`);
+        if (!existsSync(agentPath)) return `(agent ${agentName} not found)`;
 
-      const instruction = [
-        `Run this workflow as a subagent chain (sequential, each step receives {previous}):`,
-        "",
-        "```json",
-        JSON.stringify({ chain }, null, 2),
-        "```",
-        "",
-        `Workflow: ${params.workflow} (${chain.length} steps)`,
-        chainDescription,
-        "",
-        "Execute using the subagent tool with chain mode.",
-      ].join("\n");
+        let agentModel: string | undefined;
+        let agentTools: string[] = [];
+        let agentSystemPrompt = "";
+        try {
+          const agentContent = readFileSync(agentPath, "utf8");
+          const fmMatch = agentContent.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+          if (fmMatch) {
+            const fmLines = fmMatch[1].split("\n");
+            agentSystemPrompt = fmMatch[2];
+            for (const line of fmLines) {
+              const modelMatch = line.match(/^model:\s*(.+)$/);
+              if (modelMatch) agentModel = modelMatch[1].trim();
+              const toolsMatch = line.match(/^tools:\s*(.+)$/);
+              if (toolsMatch) agentTools = toolsMatch[1].split(",").map((t: string) => t.trim()).filter(Boolean);
+            }
+          }
+        } catch { /* ignore */ }
 
-      pi.sendUserMessage(instruction, { mode: "followUp" });
+        return new Promise<string>((resolve) => {
+          const args: string[] = ["--mode", "json", "-p", "--no-session"];
+          if (agentModel) args.push("--model", agentModel);
+          if (agentTools.length > 0) args.push("--tools", agentTools.join(","));
+
+          let tmpDir: string | null = null;
+          let tmpPath: string | null = null;
+          if (agentSystemPrompt.trim()) {
+            tmpDir = fs.mkdtempSync(join(os.tmpdir(), "squad-wf-"));
+            tmpPath = join(tmpDir, `${agentName}.md`);
+            fs.writeFileSync(tmpPath, agentSystemPrompt, { encoding: "utf-8", mode: 0o600 });
+            args.push("--append-system-prompt", tmpPath);
+          }
+
+          args.push(`Task: ${taskPrompt}`);
+
+          const allPaths = (process.env.GSD_BUNDLED_EXTENSION_PATHS ?? "").split(":").filter(Boolean);
+          const heavyExtensions = ["browser-tools", "mac-tools", "bg-shell", "slash-commands", "ask-user-questions", "get-secrets-from-user"];
+          const slimPaths = allPaths.filter(p => !heavyExtensions.some(h => p.includes(h)));
+          const extensionArgs = slimPaths.flatMap(p => ["--extension", p]);
+
+          const proc = spawn(
+            process.execPath,
+            [process.env.GSD_BIN_PATH!, ...extensionArgs, ...args],
+            { cwd: ctx.cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] }
+          );
+
+          let buffer = "";
+          let finalOutput = "";
+
+          proc.stdout.on("data", (data: Buffer) => {
+            buffer += data.toString();
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              try {
+                const event = JSON.parse(line);
+                if (event.type === "message_end" && event.message?.role === "assistant") {
+                  for (const part of event.message.content ?? []) {
+                    if (part.type === "text") finalOutput = part.text;
+                  }
+                }
+              } catch { /* skip */ }
+            }
+          });
+
+          proc.on("close", () => {
+            try { if (tmpPath) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+            try { if (tmpDir) fs.rmdirSync(tmpDir); } catch { /* ignore */ }
+            resolve(finalOutput || "(no output)");
+          });
+
+          proc.on("error", () => resolve("(spawn error)"));
+
+          if (signal) {
+            const kill = () => { proc.kill("SIGTERM"); setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 3000); };
+            if (signal.aborted) kill();
+            else signal.addEventListener("abort", kill, { once: true });
+          }
+        });
+      };
+
+      // Execute chain sequentially: each step gets previous output
+      const results: { agent: string; output: string }[] = [];
+      let previousOutput = "";
+
+      for (let i = 0; i < chain.length; i++) {
+        const step = chain[i];
+        const taskWithPrevious = step.task.replace(/\{previous\}/g, previousOutput);
+
+        onUpdate?.({
+          content: [{ type: "text", text: `Step ${i + 1}/${chain.length}: ${step.agent}...` }],
+          details: { squad: params.squad, workflow: params.workflow, steps: chain.length, agents: chain.map(s => s.agent) },
+        });
+
+        const output = await spawnAgent(step.agent, taskWithPrevious);
+        results.push({ agent: step.agent, output });
+        previousOutput = output;
+      }
+
+      const finalSummary = results
+        .map((r, i) => `### Step ${i + 1}: ${r.agent}\n${r.output}`)
+        .join("\n\n---\n\n");
 
       return {
-        content: [
-          {
-            type: "text",
-            text: `Workflow "${params.workflow}" dispatched with ${chain.length} steps.`,
-          },
-        ],
+        content: [{ type: "text", text: finalSummary }],
         details: {
           squad: params.squad,
           workflow: params.workflow,

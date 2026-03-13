@@ -80,30 +80,15 @@ export interface ParsedSquad {
 // ─── Helpers ─────────────────────────────────────────────────
 
 function parseYamlFrontmatter(content: string): { data: Record<string, any>; body: string } {
-  // Format 1: Standard YAML frontmatter (--- ... ---)
-  const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
-  if (fmMatch) {
-    try {
-      const data = (yaml.load(fmMatch[1]) as Record<string, any>) || {};
-      return { data, body: fmMatch[2] };
-    } catch {
-      return { data: {}, body: fmMatch[2] || content };
-    }
-  }
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  if (!match) return { data: {}, body: content };
 
-  // Format 2: YAML inside markdown code block (```yaml ... ```)
-  // May appear after headings or other content
-  const cbMatch = content.match(/```ya?ml\r?\n([\s\S]*?)\r?\n```\r?\n?([\s\S]*)$/);
-  if (cbMatch) {
-    try {
-      const data = (yaml.load(cbMatch[1]) as Record<string, any>) || {};
-      return { data, body: cbMatch[2] };
-    } catch {
-      return { data: {}, body: cbMatch[2] || content };
-    }
+  try {
+    const data = (yaml.load(match[1]) as Record<string, any>) || {};
+    return { data, body: match[2] };
+  } catch {
+    return { data: {}, body: match[2] || content };
   }
-
-  return { data: {}, body: content };
 }
 
 function parseYamlFile(content: string): Record<string, any> {
@@ -172,9 +157,6 @@ export function parseAgent(agentPath: string, squadName: string, squadDir: strin
     const persona = data.persona || {};
     const personaProfile = data.persona_profile || {};
 
-    // Support flat schema where id/name/role are at root level (not nested under agent:)
-    const isFlat = !data.agent && (data.id || data.name);
-
     const commands: SquadCommand[] = safeArray(data.commands).map((c: any) => ({
       name: safeStr(c.name),
       description: safeStr(c.description),
@@ -186,17 +168,17 @@ export function parseAgent(agentPath: string, squadName: string, squadDir: strin
     }));
 
     return {
-      id: safeStr(isFlat ? data.id : agent.id) || basename(agentPath, ".md"),
-      name: safeStr(isFlat ? data.name : agent.name),
-      title: safeStr(isFlat ? (data.title || data.role) : agent.title),
-      icon: safeStr(isFlat ? (data.icon || "") : agent.icon),
-      whenToUse: safeStr(isFlat ? (data.whenToUse || data.description || "") : agent.whenToUse),
-      role: safeStr(isFlat ? (data.role || "") : persona.role),
-      style: safeStr(isFlat ? (data.style || data.archetype || "") : (persona.style || personaProfile?.communication?.tone)),
-      identity: safeStr(isFlat ? (data.identity || "") : persona.identity),
-      focus: safeStr(isFlat ? (data.focus || "") : persona.focus),
-      corePrinciples: safeArray(isFlat ? data.core_principles : persona.core_principles),
-      responsibilityBoundaries: safeArray(isFlat ? data.responsibility_boundaries : persona.responsibility_boundaries),
+      id: safeStr(agent.id) || basename(agentPath, ".md"),
+      name: safeStr(agent.name),
+      title: safeStr(agent.title),
+      icon: safeStr(agent.icon),
+      whenToUse: safeStr(agent.whenToUse),
+      role: safeStr(persona.role),
+      style: safeStr(persona.style || personaProfile?.communication?.tone),
+      identity: safeStr(persona.identity),
+      focus: safeStr(persona.focus),
+      corePrinciples: safeArray(persona.core_principles),
+      responsibilityBoundaries: safeArray(persona.responsibility_boundaries),
       commands,
       taskFiles: safeArray(data.dependencies?.tasks),
       squadName,
