@@ -211,8 +211,22 @@ export default function squadLoader(pi: ExtensionAPI) {
     promptGuidelines: [
       "The squad must be activated first via squad_activate",
       "Provide the full agent ID: squad--{squad-name}--{agent-id}",
-      "Provide a clear task description with all necessary context",
-      "The agent runs in an isolated context and returns structured output",
+      // --- HOW TO WRITE EFFECTIVE TASK PROMPTS ---
+      "TASK PROMPT = INSTRUCTIONS, NOT CODE. Write what the agent should DO, not the implementation itself.",
+      "The agent has its own tools (read, write, edit, bash, search) — it reads files and implements by itself.",
+      "Reference file paths instead of pasting file contents: e.g. 'Read src/lib/billing.ts and add Stripe Connect functions as described in .gsd/milestones/M001/slices/S09/S09-PLAN.md T02'",
+      "Reference plan docs instead of duplicating specs: e.g. 'Implement T01 from S09-PLAN.md — DB migration for multi-tenant'",
+      "Keep task prompts SHORT and DIRECTIVE: WHO does WHAT, WHERE to find context, WHAT success looks like",
+      // --- ANTI-PATTERNS ---
+      "NEVER paste SQL migrations, TypeScript code, or full file contents inline in the task prompt",
+      "NEVER duplicate content that already exists in plan files (.gsd/milestones/) or docs",
+      "NEVER send multiple large tasks in a single dispatch — break into focused single-responsibility tasks",
+      "NEVER use squads for tasks you can implement directly — use them for domain expertise (design, copy, security audit, architecture review)",
+      // --- GOOD EXAMPLES ---
+      "GOOD: 'Read S09-PLAN.md T01, implement the DB migration in supabase/migrations/, run verify-s09.sh to confirm'",
+      "GOOD: 'Review src/lib/admin.ts for security vulnerabilities. Focus on auth bypass and injection risks. Report severity + fix per issue.'",
+      "BAD: 'Implement this migration: [500 lines of SQL pasted here]...'",
+      "BAD: 'Create this file: [full TypeScript implementation pasted here]...'",
     ],
     parameters: Type.Object({
       agent: Type.String({
@@ -240,6 +254,42 @@ export default function squadLoader(pi: ExtensionAPI) {
           ],
           isError: true,
         };
+      }
+
+      // Guard: task prompt size check.
+      // Large prompts (code/SQL pasted inline) cause spawn ARG_MAX failures and poor agent results.
+      const TASK_WARN_BYTES = 4_096;   // 4KB — warn
+      const TASK_HARD_BYTES = 16_384;  // 16KB — reject (well below macOS ARG_MAX, leaves room for extensions)
+      const taskBytes = Buffer.byteLength(params.task, "utf8");
+      if (taskBytes > TASK_HARD_BYTES) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: [
+                `[SQUAD-LOADER] Task prompt is too large (${Math.round(taskBytes / 1024)}KB). Dispatch rejected.`,
+                "",
+                "Rule: task prompts must be INSTRUCTIONS, not code or file contents.",
+                "Instead of pasting content, reference the file path:",
+                "  ✅ 'Read src/lib/billing.ts and implement the Stripe Connect functions described in .gsd/milestones/M001/slices/S09/S09-PLAN.md T02'",
+                "  ❌ 'Implement this file: [3000 lines of TypeScript pasted here]'",
+                "",
+                "Reduce the task prompt to under 4KB and retry.",
+              ].join("\n"),
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (taskBytes > TASK_WARN_BYTES) {
+        onUpdate?.({
+          content: [
+            {
+              type: "text",
+              text: `[SQUAD-LOADER] Warning: task prompt is ${Math.round(taskBytes / 1024)}KB. Prefer referencing file paths over pasting content inline.`,
+            },
+          ],
+        });
       }
 
       let taskPrompt = params.task;
@@ -377,6 +427,9 @@ export default function squadLoader(pi: ExtensionAPI) {
       "Provide the workflow name from the squad's workflows/",
       "Each step runs as a separate subagent with {previous} replaced by prior output",
       "Provide initial context that the first agent needs",
+      "Context should be a BRIEFING (project goal, constraints, where to find specs) — not code or file contents",
+      "Good context: 'Project: Metabolic Monitor SaaS. Stack: Next.js 15, Supabase, Stripe. Codebase: /Users/guto/Projects/metabolic-monitor-v2. Specs: .gsd/milestones/M001/slices/S09/S09-PLAN.md'",
+      "Bad context: '[500 lines of SQL and TypeScript pasted here]'",
     ],
     parameters: Type.Object({
       squad: Type.String({ description: "Squad name" }),
@@ -838,46 +891,81 @@ export default function squadLoader(pi: ExtensionAPI) {
   // ─── Event Hooks ─────────────────────────────────────────
 
   /**
-   * Inject squad context into the agent's system prompt when squads are activated.
-   * This makes the LLM aware of available squad agents and how to use them.
+   * Inject squad operating rules into the agent's system prompt.
+   * Always injected (even with no squads active) so the agent knows the correct
+   * approach BEFORE it attempts any squad operation. When squads are already
+   * activated the section is extended with agent inventory.
    */
   pi.on("before_agent_start", async (event, ctx) => {
-    if (state.activatedAgents.size === 0) return;
-
-    // Build squad awareness section
-    const sections = [
-      "\n\n[SQUAD-LOADER CONTEXT]",
+    const sections: string[] = [
+      "\n\n[SQUAD-LOADER — OPERATING RULES]",
       "",
-      "You have access to specialized squad agents. Use the squad_* tools to:",
-      "- squad_list: Discover available squads",
-      "- squad_activate: Load a squad's agents",
-      "- squad_dispatch: Send a task to a specific squad agent",
-      "- squad_workflow: Run a multi-agent workflow chain",
-      "- squad_inject: Feed artifacts into the GSD context",
+      "squad_* tools are available. Follow these rules every time:",
       "",
-      "Currently activated squads:",
+      "## RULE 1 — ALWAYS DISCOVER DYNAMICALLY",
+      "Squad names vary per installation. NEVER assume or hardcode squad names.",
+      "Mandatory sequence before any squad operation:",
+      "  1. squad_list → read results → identify the right squad for the task",
+      "  2. squad_activate 'exact-name-from-list'",
+      "  3. squad_dispatch or squad_workflow using exact agent IDs from activation output",
+      "",
+      "## RULE 2 — TASK PROMPTS = INSTRUCTIONS, NOT CODE",
+      "squad_dispatch 'task' = what the agent should DO. The agent has its own tools.",
+      "NEVER paste SQL, TypeScript, file contents, or large text inline.",
+      "ALWAYS reference file paths and plan docs instead of duplicating content.",
+      "Hard limit: if your task prompt exceeds ~2KB, break it up or reference files.",
+      "",
+      "Task prompt formula:",
+      "  GOAL (1-2 sentences) + CONTEXT (file path or plan doc) + DONE WHEN (one criterion)",
+      "",
+      "  ✅ GOOD: 'Read .gsd/milestones/M001/slices/S09/S09-PLAN.md T01. Implement the DB",
+      "           migration in supabase/migrations/. Run verify-s09.sh when done.'",
+      "  ✅ GOOD: 'Review src/lib/admin.ts for auth bypass and injection risks.',",
+      "           'Report: file, line, severity, recommended fix.'",
+      "  ❌ BAD:  'Implement this migration: CREATE TABLE... [500 lines of SQL]'",
+      "  ❌ BAD:  'Create this file: import React... [300 lines of TypeScript]'",
+      "",
+      "## RULE 3 — SELF-SUPERVISE CONTEXT BUDGET",
+      "Before dispatching: if you've accumulated many large tool results, write a handoff",
+      "note and stop. A dispatch that starts with a fresh context gives better results.",
+      "Signs you must stop: 3+ dispatches done, a dispatch returned '(no output)' or",
+      "'(spawn error)', or you were about to paste file contents into a task prompt.",
+      "",
+      "## RULE 4 — ONE RESPONSIBILITY PER DISPATCH",
+      "Each squad_dispatch = one focused goal. Never bundle unrelated tasks.",
+      "",
+      "## RULE 5 — SQUADS vs DIRECT IMPLEMENTATION",
+      "Use squads for: security audit, code review, UX critique, copy/marketing,",
+      "  architecture review, domain research.",
+      "Implement directly for: routine coding, file edits, bug fixes in known code.",
     ];
 
-    for (const [name, agents] of state.activatedAgents) {
-      const squad = state.loadedSquads.get(name);
-      sections.push(`  ${name} (${agents.length} agents):`);
-      for (const agentName of agents) {
-        const agent = squad?.agents.find(
-          (a) => `squad--${name}--${a.id}` === agentName
-        );
-        if (agent) {
-          sections.push(`    ${agent.icon} ${agentName}: ${agent.whenToUse}`);
+    if (state.activatedAgents.size === 0) {
+      sections.push("");
+      sections.push("No squads currently activated. Call squad_list to discover available squads.");
+    } else {
+      sections.push("");
+      sections.push("Currently activated squads:");
+      for (const [name, agents] of state.activatedAgents) {
+        const squad = state.loadedSquads.get(name);
+        sections.push(`  ${name} (${agents.length} agents):`);
+        for (const agentName of agents) {
+          const agent = squad?.agents.find(
+            (a) => `squad--${name}--${a.id}` === agentName
+          );
+          if (agent) {
+            sections.push(`    ${agent.icon} ${agentName}: ${agent.whenToUse}`);
+          }
         }
       }
+      sections.push("");
+      sections.push(
+        "When a task requires domain expertise (design, marketing, copy, pricing, etc.), " +
+        "dispatch the appropriate squad agent instead of attempting it yourself."
+      );
     }
 
-    sections.push("");
-    sections.push(
-      "When a task requires domain expertise (design, marketing, copy, pricing, etc.), " +
-      "dispatch the appropriate squad agent instead of attempting it yourself."
-    );
-
-    // Also inject any squad-context files from .gsd/squad-context/
+    // Inject any squad-context files from .gsd/squad-context/
     const cwd = ctx.cwd || process.cwd();
     const contextDir = join(cwd, ".gsd", "squad-context");
     if (existsSync(contextDir)) {
