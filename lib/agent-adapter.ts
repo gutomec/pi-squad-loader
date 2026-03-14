@@ -634,7 +634,12 @@ export function buildTaskPrompt(
     }
   }
 
-  // Context from dependency steps
+  // Context from dependency steps — FILE REFERENCES, not inline content.
+  //
+  // Previous agents save artifacts to squads-output/{squad}/.
+  // We tell this agent WHERE to find them and give a brief summary.
+  // The agent uses its own read tool to access full content.
+  // This prevents context overflow from embedding 50-200KB of text inline.
   if (step.requires.length > 0) {
     const depOutputs = step.requires
       .filter((req) => completedArtifacts.has(req))
@@ -642,25 +647,36 @@ export function buildTaskPrompt(
 
     if (depOutputs.length > 0) {
       sections.push("## Resultados dos Steps Anteriores");
+      sections.push("");
+      sections.push(`Todos os artefatos dos steps anteriores estão salvos em: \`squads-output/${squadName}/\``);
+      sections.push("Use a ferramenta **read** para ler os arquivos que precisar. NÃO tente ler todos de uma vez — leia apenas os necessários para sua tarefa.");
+      sections.push("");
+
       for (const dep of depOutputs) {
         sections.push(`### Artefato: ${dep.name}`);
-        // Truncate very long outputs to avoid context overflow
-        const maxLen = 8000;
-        if (dep.output.length > maxLen) {
-          sections.push(dep.output.slice(0, maxLen));
-          sections.push(`\n... (truncado — ${dep.output.length} chars total)`);
-        } else {
-          sections.push(dep.output);
+        // Extract just the summary/criteria from the agent's output (first ~1KB)
+        // The full content is on disk — the agent reads it via tools
+        const summaryLen = 1000;
+        const summary = dep.output.slice(0, summaryLen);
+        const truncated = dep.output.length > summaryLen;
+        sections.push("**Resumo do output do agente anterior:**");
+        sections.push(summary);
+        if (truncated) {
+          sections.push(`\n_(resumo truncado — output completo tem ${Math.round(dep.output.length / 1024)}KB. Leia os arquivos em squads-output/${squadName}/ para o conteúdo completo.)_`);
         }
         sections.push("");
       }
     }
   }
 
-  // Output convention
+  // Output convention & file reading guidance
   sections.push("## Convenção de Output");
-  sections.push(`Salve todos os artefatos em: squads-output/${squadName}/`);
+  sections.push(`Salve todos os artefatos em: \`squads-output/${squadName}/\``);
   sections.push("Nomeie os arquivos de forma descritiva baseado nos outputs esperados acima.");
+  sections.push("");
+  sections.push("## Arquivos Disponíveis dos Steps Anteriores");
+  sections.push(`Diretório: \`squads-output/${squadName}/\``);
+  sections.push("Use **read** para acessar qualquer arquivo que precise. Leia seletivamente — apenas o que for necessário para a sua tarefa.");
 
   return sections.join("\n");
 }
