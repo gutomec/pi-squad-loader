@@ -1,9 +1,14 @@
 /**
  * squad-parser.ts
  *
- * Parses squad.yaml manifests and agent .md files into
- * structured objects that the extension can consume.
- * Uses js-yaml for reliable deep YAML parsing.
+ * Parses squad.yaml manifests, agent .md files, task .md files,
+ * and workflow .yaml files into structured objects.
+ *
+ * Every type maps 1:1 to the schemas defined in the squads skill:
+ *   - references/squad-yaml-schema.md
+ *   - references/agent-schema.md
+ *   - references/task-schema.md
+ *   - references/workflow-schema.md
  */
 
 import { readFileSync, readdirSync, existsSync } from "fs";
@@ -11,6 +16,12 @@ import { join, basename } from "path";
 import yaml from "js-yaml";
 
 // ─── Types ───────────────────────────────────────────────────
+
+export interface SquadManifestTriggers {
+  enabled: boolean;
+  logPath: string;
+  events: { squad: boolean; agent: boolean; task: boolean };
+}
 
 export interface SquadManifest {
   name: string;
@@ -24,6 +35,7 @@ export interface SquadManifest {
     workflows: string[];
   };
   tags: string[];
+  triggers: SquadManifestTriggers;
 }
 
 export interface SquadAgent {
@@ -51,13 +63,31 @@ export interface SquadCommand {
   args: { name: string; description: string; required: boolean }[];
 }
 
+export interface SquadTaskErrorHandling {
+  strategy: "retry" | "fallback" | "abort";
+  maxAttempts: number;
+  delay: string;
+  fallback: string;
+}
+
+export interface SquadTaskPerformance {
+  duration: string;
+  cost: string;
+  cacheable: boolean;
+  parallelizable: boolean;
+  skippableWhen: string;
+}
+
 export interface SquadTask {
   name: string;
   agent: string;
-  entrada: { nome: string; tipo: string; descricao: string }[];
-  saida: { nome: string; tipo: string; descricao: string }[];
+  entrada: { nome: string; tipo: string; obrigatorio: boolean; descricao: string }[];
+  saida: { nome: string; tipo: string; obrigatorio: boolean; descricao: string }[];
   preConditions: string[];
   postConditions: string[];
+  acceptanceCriteria: { blocker: boolean; criteria: string }[];
+  errorHandling: SquadTaskErrorHandling;
+  performance: SquadTaskPerformance;
   content: string;
   filePath: string;
 }
@@ -66,7 +96,8 @@ export interface SquadWorkflow {
   name: string;
   description: string;
   agentSequence: string[];
-  steps: { agent: string; action: string; creates: string }[];
+  steps: { agent: string; action: string; creates: string; requires: string[] }[];
+  successIndicators: string[];
   filePath: string;
 }
 
@@ -91,7 +122,7 @@ function parseYamlFrontmatter(content: string): { data: Record<string, any>; bod
     }
   }
 
-  // Format 2: AIOS-style ```yaml code block (used by most squad agent files)
+  // Format 2: AIOS-style ```yaml code block
   const aiosMatch = content.match(/^```ya?ml\r?\n([\s\S]*?)\r?\n```\r?\n?([\s\S]*)$/);
   if (aiosMatch) {
     try {
@@ -121,6 +152,10 @@ function safeStr(val: any): string {
   return typeof val === "string" ? val : String(val || "");
 }
 
+function safeBool(val: any, fallback = false): boolean {
+  return typeof val === "boolean" ? val : fallback;
+}
+
 // ─── Public API ─────────────────────────────────────────────
 
 export function discoverSquads(squadsDir: string): SquadManifest[] {
@@ -139,6 +174,8 @@ export function discoverSquads(squadsDir: string): SquadManifest[] {
       const content = readFileSync(yamlPath, "utf8");
       const parsed = parseYamlFile(content);
 
+      const triggers = parsed.triggers || {};
+
       manifests.push({
         name: safeStr(parsed.name) || entry,
         version: safeStr(parsed.version) || "0.0.0",
@@ -151,6 +188,15 @@ export function discoverSquads(squadsDir: string): SquadManifest[] {
           workflows: safeArray(parsed.components?.workflows),
         },
         tags: safeArray(parsed.tags),
+        triggers: {
+          enabled: safeBool(triggers.enabled),
+          logPath: safeStr(triggers.logPath) || ".aios/squad-triggers/",
+          events: {
+            squad: safeBool(triggers.events?.squad, true),
+            agent: safeBool(triggers.events?.agent, true),
+            task: safeBool(triggers.events?.task, true),
+          },
+        },
       });
     } catch {
       // Skip unparseable squads
@@ -211,21 +257,50 @@ export function parseTask(taskPath: string): SquadTask | null {
     const content = readFileSync(taskPath, "utf8");
     const { data, body } = parseYamlFrontmatter(content);
 
+    // Parse Error Handling (key can be "Error Handling" or "ErrorHandling")
+    const eh = data["Error Handling"] || data.ErrorHandling || {};
+    const retryConfig = eh.retry || {};
+
+    // Parse Performance
+    const perf = data.Performance || {};
+
+    // Parse Checklist — supports both "pre"/"post" and "pre-conditions"/"post-conditions"
+    const checklist = data.Checklist || {};
+
     return {
       name: safeStr(data.task) || basename(taskPath, ".md"),
       agent: safeStr(data.responsavel),
       entrada: safeArray(data.Entrada).map((e: any) => ({
-        nome: safeStr(e.nome),
-        tipo: safeStr(e.tipo) || "string",
-        descricao: safeStr(e.descricao),
+        nome: safeStr(e.nome || e.name),
+        tipo: safeStr(e.tipo || e.type) || "string",
+        obrigatorio: e.obrigatorio !== false && e.required !== false,
+        descricao: safeStr(e.descricao || e.description),
       })),
       saida: safeArray(data.Saida).map((s: any) => ({
-        nome: safeStr(s.nome),
-        tipo: safeStr(s.tipo) || "string",
-        descricao: safeStr(s.descricao),
+        nome: safeStr(s.nome || s.name),
+        tipo: safeStr(s.tipo || s.type) || "string",
+        obrigatorio: s.obrigatorio !== false && s.required !== false,
+        descricao: safeStr(s.descricao || s.description),
       })),
-      preConditions: safeArray(data.Checklist?.["pre-conditions"]),
-      postConditions: safeArray(data.Checklist?.["post-conditions"]),
+      preConditions: safeArray(checklist["pre-conditions"] || checklist.pre),
+      postConditions: safeArray(checklist["post-conditions"] || checklist.post),
+      acceptanceCriteria: safeArray(checklist["acceptance-criteria"]).map((a: any) => ({
+        blocker: a.blocker === true,
+        criteria: safeStr(a.criteria),
+      })),
+      errorHandling: {
+        strategy: (eh.strategy as "retry" | "fallback" | "abort") || "abort",
+        maxAttempts: Number(retryConfig.max_attempts) || 1,
+        delay: safeStr(retryConfig.delay) || "0s",
+        fallback: safeStr(eh.fallback),
+      },
+      performance: {
+        duration: safeStr(perf.duration_expected || perf.duration),
+        cost: safeStr(perf.cost_estimated || perf.cost),
+        cacheable: safeBool(perf.cacheable),
+        parallelizable: safeBool(perf.parallelizable),
+        skippableWhen: safeStr(perf.skippable_when || perf.skippableWhen),
+      },
       content: body,
       filePath: taskPath,
     };
@@ -242,17 +317,25 @@ export function parseWorkflow(workflowPath: string): SquadWorkflow | null {
     const parsed = parseYamlFile(content);
 
     const workflow = parsed.workflow || {};
-    const steps = safeArray(workflow.sequence).map((s: any) => ({
-      agent: safeStr(s.agent),
-      action: safeStr(s.action),
-      creates: safeStr(s.creates),
-    }));
+    const steps = safeArray(workflow.sequence).map((s: any) => {
+      const req = s.requires;
+      const requires: string[] = Array.isArray(req)
+        ? req.map((r: any) => safeStr(r)).filter(Boolean)
+        : req ? [safeStr(req)].filter(Boolean) : [];
+      return {
+        agent: safeStr(s.agent),
+        action: safeStr(s.action),
+        creates: safeStr(s.creates),
+        requires,
+      };
+    });
 
     return {
       name: safeStr(parsed.workflow_name) || basename(workflowPath, ".yaml"),
       description: safeStr(parsed.description),
       agentSequence: safeArray(parsed.agent_sequence),
       steps,
+      successIndicators: safeArray(parsed.success_indicators),
       filePath: workflowPath,
     };
   } catch {

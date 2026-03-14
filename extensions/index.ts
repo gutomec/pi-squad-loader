@@ -2,28 +2,20 @@
  * squad-loader — GSD-PI Extension
  *
  * Loads the Squads ecosystem into GSD-PI as native subagents.
- * Squad agents become Pi subagents, squad workflows become chain dispatches,
- * and squad artifacts are injected into the GSD context.
+ * Squad agents become Pi subagents, squad workflows become chain dispatches.
  *
- * Commands:
- *   /squad list              — List all available squads
- *   /squad agents {name}     — List agents in a squad
- *   /squad activate {name}   — Load squad agents into Pi agent cache
- *   /squad run {name} {wf}   — Run a squad workflow as a subagent chain
- *   /squad inject {path}     — Inject artifact into GSD context
- *   /squad status            — Show loaded squads and agents
- *
- * Tools:
- *   squad_list               — List squads (LLM-callable)
- *   squad_activate           — Activate a squad (LLM-callable)
- *   squad_dispatch           — Dispatch a squad agent (LLM-callable)
- *   squad_workflow            — Run a squad workflow chain (LLM-callable)
- *   squad_inject             — Inject artifact into .gsd/ (LLM-callable)
+ * Key improvements over v1:
+ * - squad_dispatch resolves task contracts and injects them into the prompt
+ * - squad_workflow validates pre/post conditions per step
+ * - squad_workflow implements retry logic from task Error Handling config
+ * - Trigger events are emitted to .aios/squad-triggers/ when enabled
+ * - Agent prompts are delivered via stdin (not CLI args) to avoid ARG_MAX
+ * - Output validation parses the agent's self-validation report
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "fs";
 import { join, resolve } from "path";
 import { spawn } from "node:child_process";
 import * as os from "node:os";
@@ -34,7 +26,15 @@ import {
   type SquadManifest,
   type ParsedSquad,
 } from "../lib/squad-parser.js";
-import { adaptSquad, buildWorkflowChain } from "../lib/agent-adapter.js";
+import {
+  adaptSquad,
+  buildWorkflowPlan,
+  buildTaskPrompt,
+  buildDispatchPrompt,
+  resolveAgentTasks,
+  validateStepOutput,
+  type WorkflowStep,
+} from "../lib/agent-adapter.js";
 
 // ─── State ───────────────────────────────────────────────────
 
@@ -42,7 +42,7 @@ interface SquadLoaderState {
   squadsDir: string;
   manifests: SquadManifest[];
   loadedSquads: Map<string, ParsedSquad>;
-  activatedAgents: Map<string, string[]>; // squad name → pi agent names
+  activatedAgents: Map<string, string[]>;
   agentsCacheDir: string;
 }
 
@@ -54,7 +54,7 @@ const state: SquadLoaderState = {
   agentsCacheDir: "",
 };
 
-// ─── Helper ──────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────
 
 function ensureDiscovered(): boolean {
   if (state.manifests.length === 0) {
@@ -86,20 +86,16 @@ function activateSquad(name: string): string {
   const manifest = state.manifests.find((m) => m.name === name);
   if (!manifest) return `Squad "${name}" not found. Run /squad list to see available squads.`;
 
-  // Parse full squad
   const parsed = parseFullSquad(manifest);
   state.loadedSquads.set(name, parsed);
 
-  // Adapt agents to Pi format and write to cache
   const adapted = adaptSquad(parsed, state.agentsCacheDir);
   const agentNames = adapted.map((a) => a.piName);
   state.activatedAgents.set(name, agentNames);
 
   const lines = [
     `Squad "${name}" activated with ${adapted.length} agents:\n`,
-    ...adapted.map(
-      (a) => `  ${a.source.icon} ${a.piName} — ${a.source.title}`
-    ),
+    ...adapted.map((a) => `  ${a.source.icon} ${a.piName} — ${a.source.title}`),
     "",
     `Agents written to: ${state.agentsCacheDir}`,
     "",
@@ -107,6 +103,11 @@ function activateSquad(name: string): string {
     'Use the subagent tool to dispatch them, e.g.:',
     `  { "agent": "${agentNames[0]}", "task": "..." }`,
   ];
+
+  if (parsed.tasks.length > 0) {
+    lines.push("");
+    lines.push(`Task contracts loaded: ${parsed.tasks.length} (${parsed.tasks.map(t => t.name).join(", ")})`);
+  }
 
   if (parsed.workflows.length > 0) {
     lines.push("");
@@ -119,15 +120,248 @@ function activateSquad(name: string): string {
   return lines.join("\n");
 }
 
+/**
+ * Reverse lookup: find which squad an agent belongs to.
+ */
+function findSquadForAgent(agentPiName: string): ParsedSquad | null {
+  for (const [name, agents] of state.activatedAgents) {
+    if (agents.includes(agentPiName)) {
+      return state.loadedSquads.get(name) || null;
+    }
+  }
+  return null;
+}
+
+// ─── Trigger Emission ────────────────────────────────────────
+
+function emitTrigger(
+  squad: ParsedSquad,
+  cwd: string,
+  event: Record<string, any>
+): void {
+  if (!squad.manifest.triggers.enabled) return;
+
+  try {
+    const logDir = join(cwd, squad.manifest.triggers.logPath);
+    mkdirSync(logDir, { recursive: true });
+
+    const logPath = join(logDir, `${squad.manifest.name}.jsonl`);
+    const line = JSON.stringify({
+      ...event,
+      squad: squad.manifest.name,
+      prefix: squad.manifest.slashPrefix,
+      timestamp: new Date().toISOString(),
+    });
+    appendFileSync(logPath, line + "\n");
+  } catch {
+    // Non-critical — never block execution for trigger failures
+  }
+}
+
+// ─── Retry Delay ─────────────────────────────────────────────
+
+function parseDelay(delay: string): number {
+  if (!delay || delay === "immediate" || delay === "0s") return 0;
+  const match = delay.match(/^(\d+)(ms|s|m)?$/);
+  if (!match) return 1000;
+  const val = Number(match[1]);
+  switch (match[2]) {
+    case "ms": return val;
+    case "m": return val * 60_000;
+    case "s": default: return val * 1000;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ─── Agent Spawn ─────────────────────────────────────────────
+
+/**
+ * Spawns a squad agent as a gsd subprocess in json/print mode.
+ *
+ * Key design decisions:
+ * - Prompt is delivered via stdin (not CLI arg) to avoid ARG_MAX limits
+ * - System prompt is appended via --append-system-prompt temp file
+ * - Model is inherited from session (not hardcoded per agent)
+ */
+async function spawnSquadAgent(
+  agentName: string,
+  taskPrompt: string,
+  cwd: string,
+  signal?: AbortSignal,
+  onStepUpdate?: (text: string) => void
+): Promise<string> {
+  const agentPath = join(state.agentsCacheDir, `${agentName}.md`);
+  if (!existsSync(agentPath))
+    return `[squad-agent] Agent ${agentName} not found in cache.`;
+
+  // Parse agent file for optional model, tools, and system prompt
+  let agentModel: string | undefined;
+  let agentTools: string[] = [];
+  let agentSystemPrompt = "";
+  try {
+    const agentContent = readFileSync(agentPath, "utf8");
+    const fmMatch = agentContent.match(
+      /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/
+    );
+    if (fmMatch) {
+      const fmBlock = fmMatch[1];
+      agentSystemPrompt = fmMatch[2];
+      try {
+        const parsed = (await import("js-yaml")).default.load(fmBlock) as Record<string, any>;
+        if (parsed) {
+          if (parsed.model) agentModel = String(parsed.model);
+          if (parsed.tools) {
+            agentTools = String(parsed.tools)
+              .split(",")
+              .map((t: string) => t.trim())
+              .filter(Boolean);
+          }
+        }
+      } catch {
+        for (const line of fmBlock.split("\n")) {
+          const modelMatch = line.match(/^model:\s*(.+)$/);
+          if (modelMatch) agentModel = modelMatch[1].trim();
+          const toolsMatch = line.match(/^tools:\s*(.+)$/);
+          if (toolsMatch)
+            agentTools = toolsMatch[1]
+              .split(",")
+              .map((t: string) => t.trim())
+              .filter(Boolean);
+        }
+      }
+    }
+  } catch {
+    /* ignore parse errors */
+  }
+
+  return new Promise<string>((resolvePromise) => {
+    const args: string[] = ["--mode", "json", "-p", "--no-session"];
+    if (agentModel) args.push("--model", agentModel);
+    if (agentTools.length > 0) args.push("--tools", agentTools.join(","));
+
+    // Write system prompt to temp file for --append-system-prompt
+    let tmpDir: string | null = null;
+    let tmpPath: string | null = null;
+    if (agentSystemPrompt.trim()) {
+      tmpDir = fs.mkdtempSync(join(os.tmpdir(), "squad-agent-"));
+      tmpPath = join(tmpDir, `${agentName}.md`);
+      fs.writeFileSync(tmpPath, agentSystemPrompt, {
+        encoding: "utf-8",
+        mode: 0o600,
+      });
+      args.push("--append-system-prompt", tmpPath);
+    }
+
+    // NOTE: Prompt is NOT passed as a CLI arg anymore.
+    // It's delivered via stdin to avoid ARG_MAX limits with large prompts.
+
+    const bundledPaths = (process.env.GSD_BUNDLED_EXTENSION_PATHS ?? "")
+      .split(":")
+      .filter(Boolean);
+    const extensionArgs = bundledPaths.flatMap((p) => ["--extension", p]);
+
+    const proc = spawn(
+      process.execPath,
+      [process.env.GSD_BIN_PATH!, ...extensionArgs, ...args],
+      { cwd, shell: false, stdio: ["pipe", "pipe", "pipe"] }
+    );
+
+    // Deliver prompt via stdin then close (triggers readPipedStdin in Pi)
+    proc.stdin!.end(taskPrompt);
+
+    let buffer = "";
+    let finalOutput = "";
+    let stderr = "";
+    let turns = 0;
+
+    const processLine = (line: string) => {
+      if (!line.trim()) return;
+      let event: any;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (
+        event.type === "message_end" &&
+        event.message?.role === "assistant"
+      ) {
+        turns++;
+        for (const part of event.message.content ?? []) {
+          if (part.type === "text") {
+            finalOutput = part.text;
+            onStepUpdate?.(finalOutput);
+          }
+        }
+      }
+    };
+
+    proc.stdout.on("data", (data: Buffer) => {
+      buffer += data.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) processLine(line);
+    });
+
+    proc.stderr.on("data", (data: Buffer) => {
+      stderr += data.toString();
+    });
+
+    proc.on("close", (code) => {
+      if (buffer.trim()) processLine(buffer);
+
+      // Cleanup temp files
+      try { if (tmpPath) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+      try { if (tmpDir) fs.rmdirSync(tmpDir); } catch { /* ignore */ }
+
+      if (!finalOutput) {
+        if (code !== 0) {
+          resolvePromise(
+            `[squad-agent] Agent ${agentName} exited with code ${code}.\n${
+              stderr ? stderr.trim() : "(no stderr)"
+            }`
+          );
+        } else if (turns === 0) {
+          resolvePromise(
+            `[squad-agent] Agent ${agentName} produced no output (0 turns).\n${
+              stderr ? stderr.trim() : ""
+            }`
+          );
+        } else {
+          resolvePromise("(no text output)");
+        }
+      } else {
+        resolvePromise(finalOutput);
+      }
+    });
+
+    proc.on("error", (err) =>
+      resolvePromise(`[squad-agent] Spawn error for ${agentName}: ${err.message}`)
+    );
+
+    if (signal) {
+      const kill = () => {
+        proc.kill("SIGTERM");
+        setTimeout(() => {
+          if (!proc.killed) proc.kill("SIGKILL");
+        }, 5000);
+      };
+      if (signal.aborted) kill();
+      else signal.addEventListener("abort", kill, { once: true });
+    }
+  });
+}
+
 // ─── Extension Entry Point ───────────────────────────────────
 
 export default function squadLoader(pi: ExtensionAPI) {
-  // Resolve squads directory
   const homeDir = process.env.HOME || process.env.USERPROFILE || "";
   state.squadsDir = resolve(homeDir, "squads");
   state.agentsCacheDir = resolve(homeDir, ".gsd", "agent", "agents");
 
-  // Ensure agents cache dir exists
   if (!existsSync(state.agentsCacheDir)) {
     mkdirSync(state.agentsCacheDir, { recursive: true });
   }
@@ -148,7 +382,7 @@ export default function squadLoader(pi: ExtensionAPI) {
         Type.String({ description: "Filter squads by name or tag" })
       ),
     }),
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
+    async execute(toolCallId, params) {
       ensureDiscovered();
       let filtered = state.manifests;
       if (params.filter) {
@@ -185,7 +419,7 @@ export default function squadLoader(pi: ExtensionAPI) {
     parameters: Type.Object({
       name: Type.String({ description: "Squad name to activate" }),
     }),
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
+    async execute(toolCallId, params, signal, onUpdate) {
       ensureDiscovered();
       onUpdate?.({
         content: [{ type: "text", text: `Activating squad "${params.name}"...` }],
@@ -202,6 +436,8 @@ export default function squadLoader(pi: ExtensionAPI) {
     },
   });
 
+  // ─── squad_dispatch — Task-Aware Agent Dispatch ──────────
+
   pi.registerTool({
     name: "squad_dispatch",
     label: "Squad Dispatch",
@@ -211,18 +447,15 @@ export default function squadLoader(pi: ExtensionAPI) {
     promptGuidelines: [
       "The squad must be activated first via squad_activate",
       "Provide the full agent ID: squad--{squad-name}--{agent-id}",
-      // --- HOW TO WRITE EFFECTIVE TASK PROMPTS ---
       "TASK PROMPT = INSTRUCTIONS, NOT CODE. Write what the agent should DO, not the implementation itself.",
       "The agent has its own tools (read, write, edit, bash, search) — it reads files and implements by itself.",
       "Reference file paths instead of pasting file contents: e.g. 'Read src/lib/billing.ts and add Stripe Connect functions as described in .gsd/milestones/M001/slices/S09/S09-PLAN.md T02'",
       "Reference plan docs instead of duplicating specs: e.g. 'Implement T01 from S09-PLAN.md — DB migration for multi-tenant'",
       "Keep task prompts SHORT and DIRECTIVE: WHO does WHAT, WHERE to find context, WHAT success looks like",
-      // --- ANTI-PATTERNS ---
       "NEVER paste SQL migrations, TypeScript code, or full file contents inline in the task prompt",
       "NEVER duplicate content that already exists in plan files (.gsd/milestones/) or docs",
       "NEVER send multiple large tasks in a single dispatch — break into focused single-responsibility tasks",
       "NEVER use squads for tasks you can implement directly — use them for domain expertise (design, copy, security audit, architecture review)",
-      // --- GOOD EXAMPLES ---
       "GOOD: 'Read S09-PLAN.md T01, implement the DB migration in supabase/migrations/, run verify-s09.sh to confirm'",
       "GOOD: 'Review src/lib/admin.ts for security vulnerabilities. Focus on auth bypass and injection risks. Report severity + fix per issue.'",
       "BAD: 'Implement this migration: [500 lines of SQL pasted here]...'",
@@ -242,7 +475,7 @@ export default function squadLoader(pi: ExtensionAPI) {
       ),
     }),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      // Verify agent exists
+      // Verify agent file exists
       const agentPath = join(state.agentsCacheDir, `${params.agent}.md`);
       if (!existsSync(agentPath)) {
         return {
@@ -256,10 +489,9 @@ export default function squadLoader(pi: ExtensionAPI) {
         };
       }
 
-      // Guard: task prompt size check.
-      // Large prompts (code/SQL pasted inline) cause spawn ARG_MAX failures and poor agent results.
-      const TASK_WARN_BYTES = 4_096;   // 4KB — warn
-      const TASK_HARD_BYTES = 16_384;  // 16KB — reject (well below macOS ARG_MAX, leaves room for extensions)
+      // Task prompt size guard
+      const TASK_WARN_BYTES = 4_096;
+      const TASK_HARD_BYTES = 16_384;
       const taskBytes = Buffer.byteLength(params.task, "utf8");
       if (taskBytes > TASK_HARD_BYTES) {
         return {
@@ -270,10 +502,7 @@ export default function squadLoader(pi: ExtensionAPI) {
                 `[SQUAD-LOADER] Task prompt is too large (${Math.round(taskBytes / 1024)}KB). Dispatch rejected.`,
                 "",
                 "Rule: task prompts must be INSTRUCTIONS, not code or file contents.",
-                "Instead of pasting content, reference the file path:",
-                "  ✅ 'Read src/lib/billing.ts and implement the Stripe Connect functions described in .gsd/milestones/M001/slices/S09/S09-PLAN.md T02'",
-                "  ❌ 'Implement this file: [3000 lines of TypeScript pasted here]'",
-                "",
+                "Reference file paths instead of pasting content.",
                 "Reduce the task prompt to under 4KB and retry.",
               ].join("\n"),
             },
@@ -292,155 +521,107 @@ export default function squadLoader(pi: ExtensionAPI) {
         });
       }
 
-      let taskPrompt = params.task;
-      if (params.context) {
-        taskPrompt = `## Context from previous agent\n${params.context}\n\n## Your Task\n${params.task}`;
+      // ── Resolve task contract for this agent ──────────────
+      const squad = findSquadForAgent(params.agent);
+      const agentTasks = squad ? resolveAgentTasks(squad, params.agent) : [];
+
+      // Build enriched prompt with task contract
+      const taskPrompt = buildDispatchPrompt(params.task, agentTasks, params.context);
+
+      // Emit triggers
+      if (squad) {
+        emitTrigger(squad, ctx.cwd, {
+          type: "agent-start",
+          agent: params.agent,
+          taskContracts: agentTasks.map((t) => t.name),
+        });
       }
 
-      // Read agent file to extract model, tools, and system prompt.
-      // Uses proper frontmatter parsing (matching subagent extension's approach).
-      let agentModel: string | undefined;
-      let agentTools: string[] = [];
-      let agentSystemPrompt = "";
-      try {
-        const agentContent = readFileSync(agentPath, "utf8");
-        const fmMatch = agentContent.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
-        if (fmMatch) {
-          const fmBlock = fmMatch[1];
-          agentSystemPrompt = fmMatch[2];
-          // Parse YAML frontmatter properly (handles multi-line values)
-          try {
-            const parsed = (await import("js-yaml")).default.load(fmBlock) as Record<string, any>;
-            if (parsed) {
-              if (parsed.model) agentModel = String(parsed.model);
-              if (parsed.tools) {
-                agentTools = String(parsed.tools).split(",").map((t: string) => t.trim()).filter(Boolean);
-              }
-            }
-          } catch {
-            // Fallback: line-by-line regex
-            for (const line of fmBlock.split("\n")) {
-              const modelMatch = line.match(/^model:\s*(.+)$/);
-              if (modelMatch) agentModel = modelMatch[1].trim();
-              const toolsMatch = line.match(/^tools:\s*(.+)$/);
-              if (toolsMatch) agentTools = toolsMatch[1].split(",").map((t: string) => t.trim()).filter(Boolean);
-            }
-          }
-        }
-      } catch {
-        // fallback: dispatch anyway with defaults
-      }
+      const startTime = Date.now();
 
       onUpdate?.({
-        content: [{ type: "text", text: `Dispatching ${params.agent}...` }],
+        content: [
+          {
+            type: "text",
+            text: `Dispatching ${params.agent}...` +
+              (agentTasks.length > 0
+                ? ` (task contract: ${agentTasks.map((t) => t.name).join(", ")})`
+                : " (no task contract found — running with user prompt only)"),
+          },
+        ],
         details: { agent: params.agent, task: params.task },
       });
 
-      // Spawn the subagent process — using the same pattern as the working `subagent` extension.
-      // Key: pass ALL bundled extensions (do NOT filter), proper JSON event tracking.
-      const output = await new Promise<string>((resolve) => {
-        const args: string[] = ["--mode", "json", "-p", "--no-session"];
-        if (agentModel) args.push("--model", agentModel);
-        if (agentTools.length > 0) args.push("--tools", agentTools.join(","));
+      const output = await spawnSquadAgent(
+        params.agent,
+        taskPrompt,
+        ctx.cwd,
+        signal,
+        (text) =>
+          onUpdate?.({
+            content: [{ type: "text", text }],
+            details: { agent: params.agent, task: params.task },
+          })
+      );
 
-        // Write system prompt to temp file
-        let tmpDir: string | null = null;
-        let tmpPath: string | null = null;
-        if (agentSystemPrompt.trim()) {
-          tmpDir = fs.mkdtempSync(join(os.tmpdir(), "squad-dispatch-"));
-          tmpPath = join(tmpDir, `${params.agent}.md`);
-          fs.writeFileSync(tmpPath, agentSystemPrompt, { encoding: "utf-8", mode: 0o600 });
-          args.push("--append-system-prompt", tmpPath);
-        }
+      const duration = Date.now() - startTime;
 
-        args.push(`Task: ${taskPrompt}`);
-
-        // Pass ALL bundled extensions — same as the subagent extension.
-        // Filtering caused silent failures when needed extensions were missing.
-        const bundledPaths = (process.env.GSD_BUNDLED_EXTENSION_PATHS ?? "").split(":").filter(Boolean);
-        const extensionArgs = bundledPaths.flatMap(p => ["--extension", p]);
-
-        const proc = spawn(
-          process.execPath,
-          [process.env.GSD_BIN_PATH!, ...extensionArgs, ...args],
-          { cwd: ctx.cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] }
-        );
-
-        let buffer = "";
-        let finalOutput = "";
-        let stderr = "";
-        let turns = 0;
-
-        const processLine = (line: string) => {
-          if (!line.trim()) return;
-          let event: any;
-          try { event = JSON.parse(line); } catch { return; }
-
-          // Track message_end events (same pattern as subagent extension)
-          if (event.type === "message_end" && event.message) {
-            const msg = event.message;
-            if (msg.role === "assistant") {
-              turns++;
-              for (const part of msg.content ?? []) {
-                if (part.type === "text") {
-                  finalOutput = part.text;
-                  onUpdate?.({
-                    content: [{ type: "text", text: finalOutput }],
-                    details: { agent: params.agent, task: params.task, turns },
-                  });
-                }
-              }
-            }
+      // ── Validate output against task contract ─────────────
+      const taskContract = agentTasks.length > 0
+        ? {
+            name: agentTasks[0].name,
+            inputs: agentTasks[0].entrada,
+            outputs: agentTasks[0].saida,
+            preConditions: agentTasks[0].preConditions,
+            postConditions: agentTasks[0].postConditions,
+            acceptanceCriteria: agentTasks[0].acceptanceCriteria,
+            content: agentTasks[0].content,
           }
-        };
+        : null;
 
-        proc.stdout.on("data", (data: Buffer) => {
-          buffer += data.toString();
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-          for (const line of lines) processLine(line);
+      const validation = validateStepOutput(output, taskContract);
+
+      // Emit end trigger
+      if (squad) {
+        emitTrigger(squad, ctx.cwd, {
+          type: "agent-end",
+          agent: params.agent,
+          duration: `${Math.round(duration / 1000)}s`,
+          validation: validation.summary,
+          isError: validation.isError,
         });
+      }
 
-        proc.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
-
-        proc.on("close", (code) => {
-          // Process remaining buffer
-          if (buffer.trim()) processLine(buffer);
-
-          // Cleanup temp files
-          try { if (tmpPath) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
-          try { if (tmpDir) fs.rmdirSync(tmpDir); } catch { /* ignore */ }
-
-          // Structured error reporting when spawn fails
-          if (!finalOutput) {
-            if (code !== 0) {
-              resolve(`[squad-dispatch] Agent exited with code ${code}.\n${stderr ? `stderr: ${stderr.trim()}` : "(no stderr)"}`);
-            } else if (turns === 0) {
-              resolve(`[squad-dispatch] Agent produced no output (0 turns). This usually means the agent file is malformed or auth failed.\n${stderr ? `stderr: ${stderr.trim()}` : ""}`);
-            } else {
-              resolve("(no text output from agent)");
-            }
-          } else {
-            resolve(finalOutput);
-          }
-        });
-
-        proc.on("error", (err) => resolve(`[squad-dispatch] Spawn error: ${err.message}`));
-
-        // Honor abort signal
-        if (signal) {
-          const kill = () => { proc.kill("SIGTERM"); setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000); };
-          if (signal.aborted) kill();
-          else signal.addEventListener("abort", kill, { once: true });
-        }
-      });
+      // Build result with validation report
+      const resultText = validation.isError
+        ? output
+        : [
+            output,
+            "",
+            "---",
+            `**Task Contract Validation:** ${validation.summary}`,
+            ...(validation.passed.length > 0
+              ? [`**Passed:** ${validation.passed.join("; ")}`]
+              : []),
+            ...(validation.failed.length > 0
+              ? [`**Failed:** ${validation.failed.join("; ")}`]
+              : []),
+          ].join("\n");
 
       return {
-        content: [{ type: "text", text: output }],
-        details: { agent: params.agent, task: params.task },
+        content: [{ type: "text", text: resultText }],
+        details: {
+          agent: params.agent,
+          task: params.task,
+          taskContracts: agentTasks.map((t) => t.name),
+          validation,
+          durationMs: duration,
+        },
       };
     },
   });
+
+  // ─── squad_workflow — Full Contract Execution Engine ──────
 
   pi.registerTool({
     name: "squad_workflow",
@@ -483,13 +664,13 @@ export default function squadLoader(pi: ExtensionAPI) {
         content: [
           {
             type: "text",
-            text: `Building workflow chain for "${params.workflow}"...`,
+            text: `Building task-aware workflow plan for "${params.workflow}"...`,
           },
         ],
       });
 
-      const chain = buildWorkflowChain(parsed, params.workflow);
-      if (!chain || chain.length === 0) {
+      const plan = buildWorkflowPlan(parsed, params.workflow);
+      if (!plan || plan.steps.length === 0) {
         return {
           content: [
             {
@@ -501,149 +682,411 @@ export default function squadLoader(pi: ExtensionAPI) {
         };
       }
 
-      // Inject initial context into first step
-      chain[0].task = `## Initial Context\n${params.context}\n\n## Task\n${chain[0].task}`;
+      // Emit squad-start trigger
+      emitTrigger(parsed, ctx.cwd, {
+        type: "squad-start",
+        workflow: plan.name,
+        totalSteps: plan.steps.length,
+        agents: plan.steps.map((s) => s.agentId),
+      });
 
-      // Helper: spawn one agent directly (matches subagent extension pattern)
-      const spawnAgent = async (agentName: string, taskPrompt: string): Promise<string> => {
-        const agentPath = join(state.agentsCacheDir, `${agentName}.md`);
-        if (!existsSync(agentPath)) return `[squad-workflow] Agent ${agentName} not found in cache.`;
+      const workflowStartTime = Date.now();
 
-        let agentModel: string | undefined;
-        let agentTools: string[] = [];
-        let agentSystemPrompt = "";
-        try {
-          const agentContent = readFileSync(agentPath, "utf8");
-          const fmMatch = agentContent.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
-          if (fmMatch) {
-            const fmBlock = fmMatch[1];
-            agentSystemPrompt = fmMatch[2];
-            try {
-              const parsed = (await import("js-yaml")).default.load(fmBlock) as Record<string, any>;
-              if (parsed) {
-                if (parsed.model) agentModel = String(parsed.model);
-                if (parsed.tools) agentTools = String(parsed.tools).split(",").map((t: string) => t.trim()).filter(Boolean);
-              }
-            } catch {
-              for (const line of fmBlock.split("\n")) {
-                const modelMatch = line.match(/^model:\s*(.+)$/);
-                if (modelMatch) agentModel = modelMatch[1].trim();
-                const toolsMatch = line.match(/^tools:\s*(.+)$/);
-                if (toolsMatch) agentTools = toolsMatch[1].split(",").map((t: string) => t.trim()).filter(Boolean);
-              }
-            }
-          }
-        } catch { /* ignore */ }
+      // ── Dependency-based execution engine with retry ──────
 
-        return new Promise<string>((resolve) => {
-          const args: string[] = ["--mode", "json", "-p", "--no-session"];
-          if (agentModel) args.push("--model", agentModel);
-          if (agentTools.length > 0) args.push("--tools", agentTools.join(","));
+      const completedArtifacts = new Map<string, string>();
+      const failedArtifacts = new Set<string>();
+      const remaining = [...plan.steps];
+      const results: {
+        step: number;
+        agent: string;
+        agentId: string;
+        output: string;
+        creates: string;
+        wave: number;
+        parallelWith: string[];
+        validation: ReturnType<typeof validateStepOutput> | null;
+        attempts: number;
+        durationMs: number;
+      }[] = [];
+      let stepCounter = 0;
+      let waveCounter = 0;
 
-          let tmpDir: string | null = null;
-          let tmpPath: string | null = null;
-          if (agentSystemPrompt.trim()) {
-            tmpDir = fs.mkdtempSync(join(os.tmpdir(), "squad-wf-"));
-            tmpPath = join(tmpDir, `${agentName}.md`);
-            fs.writeFileSync(tmpPath, agentSystemPrompt, { encoding: "utf-8", mode: 0o600 });
-            args.push("--append-system-prompt", tmpPath);
-          }
-
-          args.push(`Task: ${taskPrompt}`);
-
-          // Pass ALL bundled extensions — no filtering
-          const bundledPaths = (process.env.GSD_BUNDLED_EXTENSION_PATHS ?? "").split(":").filter(Boolean);
-          const extensionArgs = bundledPaths.flatMap(p => ["--extension", p]);
-
-          const proc = spawn(
-            process.execPath,
-            [process.env.GSD_BIN_PATH!, ...extensionArgs, ...args],
-            { cwd: ctx.cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] }
-          );
-
-          let buffer = "";
-          let finalOutput = "";
-          let stderr = "";
-          let turns = 0;
-
-          const processLine = (line: string) => {
-            if (!line.trim()) return;
-            let event: any;
-            try { event = JSON.parse(line); } catch { return; }
-            if (event.type === "message_end" && event.message?.role === "assistant") {
-              turns++;
-              for (const part of event.message.content ?? []) {
-                if (part.type === "text") finalOutput = part.text;
-              }
-            }
-          };
-
-          proc.stdout.on("data", (data: Buffer) => {
-            buffer += data.toString();
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-            for (const line of lines) processLine(line);
+      while (remaining.length > 0) {
+        // Skip steps blocked by failed dependencies
+        const blocked = remaining.filter((step) =>
+          step.requires.some((req) => failedArtifacts.has(req))
+        );
+        for (const b of blocked) {
+          remaining.splice(remaining.indexOf(b), 1);
+          stepCounter++;
+          const failedDep = b.requires.find((r) => failedArtifacts.has(r));
+          results.push({
+            step: stepCounter,
+            agent: b.agent,
+            agentId: b.agentId,
+            output: `⏭️ Skipped: dependency "${failedDep}" failed in a previous step.`,
+            creates: b.creates,
+            wave: waveCounter,
+            parallelWith: [],
+            validation: null,
+            attempts: 0,
+            durationMs: 0,
           });
+          if (b.creates) failedArtifacts.add(b.creates);
 
-          proc.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
-
-          proc.on("close", (code) => {
-            if (buffer.trim()) processLine(buffer);
-            try { if (tmpPath) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
-            try { if (tmpDir) fs.rmdirSync(tmpDir); } catch { /* ignore */ }
-
-            if (!finalOutput) {
-              if (code !== 0) resolve(`[squad-workflow] Agent ${agentName} exited with code ${code}.\n${stderr ? stderr.trim() : "(no stderr)"}`);
-              else if (turns === 0) resolve(`[squad-workflow] Agent ${agentName} produced no output (0 turns).\n${stderr ? stderr.trim() : ""}`);
-              else resolve("(no text output)");
-            } else {
-              resolve(finalOutput);
-            }
+          emitTrigger(parsed, ctx.cwd, {
+            type: "agent-end",
+            agent: b.agentId,
+            status: "skipped",
+            reason: `dependency "${failedDep}" failed`,
           });
+        }
 
-          proc.on("error", (err) => resolve(`[squad-workflow] Spawn error for ${agentName}: ${err.message}`));
+        // Find ready steps (all requires completed)
+        const ready = remaining.filter((step) =>
+          step.requires.every((req) => !req || completedArtifacts.has(req))
+        );
 
-          if (signal) {
-            const kill = () => { proc.kill("SIGTERM"); setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000); };
-            if (signal.aborted) kill();
-            else signal.addEventListener("abort", kill, { once: true });
+        if (ready.length === 0) {
+          if (remaining.length > 0) {
+            for (const r of remaining) {
+              stepCounter++;
+              results.push({
+                step: stepCounter,
+                agent: r.agent,
+                agentId: r.agentId,
+                output: `❌ Deadlock: requires [${r.requires.join(", ")}] which were never created.`,
+                creates: r.creates,
+                wave: waveCounter,
+                parallelWith: [],
+                validation: null,
+                attempts: 0,
+                durationMs: 0,
+              });
+            }
           }
-        });
-      };
+          break;
+        }
 
-      // Execute chain sequentially: each step gets previous output
-      const results: { agent: string; output: string }[] = [];
-      let previousOutput = "";
+        waveCounter++;
+        for (const r of ready) {
+          remaining.splice(remaining.indexOf(r), 1);
+        }
 
-      for (let i = 0; i < chain.length; i++) {
-        const step = chain[i];
-        const taskWithPrevious = step.task.replace(/\{previous\}/g, previousOutput);
-
+        // Report wave start
+        const agentShortNames = ready.map((s) => s.agentId);
+        const parallelLabel =
+          ready.length > 1 ? ` 🔀 parallel: ${agentShortNames.join(", ")}` : "";
         onUpdate?.({
-          content: [{ type: "text", text: `Step ${i + 1}/${chain.length}: ${step.agent}...` }],
-          details: { squad: params.squad, workflow: params.workflow, steps: chain.length, agents: chain.map(s => s.agent) },
+          content: [
+            {
+              type: "text",
+              text: `\n── Wave ${waveCounter}/${Math.ceil(plan.steps.length / ready.length)}: ${ready.length} step(s)${parallelLabel} ──`,
+            },
+          ],
         });
 
-        const output = await spawnAgent(step.agent, taskWithPrevious);
-        results.push({ agent: step.agent, output });
-        previousOutput = output;
+        // Execute each step in the wave (with retry)
+        const execPromises = ready.map(async (step) => {
+          return executeStepWithRetry(step, completedArtifacts, params.context, parsed, ctx.cwd, signal, onUpdate);
+        });
+
+        const waveResults = await Promise.all(execPromises);
+
+        // Register results
+        const parallelAgentNames = ready.length > 1 ? ready.map((s) => s.agent) : [];
+        for (const wr of waveResults) {
+          stepCounter++;
+          results.push({
+            step: stepCounter,
+            agent: wr.step.agent,
+            agentId: wr.step.agentId,
+            output: wr.output,
+            creates: wr.step.creates,
+            wave: waveCounter,
+            parallelWith: parallelAgentNames.filter((a) => a !== wr.step.agent),
+            validation: wr.validation,
+            attempts: wr.attempts,
+            durationMs: wr.durationMs,
+          });
+
+          if (wr.step.creates) {
+            if (wr.validation?.isError || wr.validation?.blockersFailed) {
+              failedArtifacts.add(wr.step.creates);
+            } else {
+              completedArtifacts.set(wr.step.creates, wr.output);
+            }
+          }
+
+          // Emit flow-transition
+          emitTrigger(parsed, ctx.cwd, {
+            type: "flow-transition",
+            from: wr.step.agentId,
+            to: remaining[0]?.agentId || "end",
+            artifact: wr.step.creates,
+            validation: wr.validation?.summary,
+            progress: `${stepCounter}/${plan.steps.length}`,
+          });
+        }
       }
 
-      const finalSummary = results
-        .map((r, i) => `### Step ${i + 1}: ${r.agent}\n${r.output}`)
+      // Emit flow-complete
+      const totalDuration = Date.now() - workflowStartTime;
+      emitTrigger(parsed, ctx.cwd, {
+        type: "flow-complete",
+        workflow: plan.name,
+        totalDuration: `${Math.round(totalDuration / 1000)}s`,
+        agentsExecuted: results.filter((r) => r.attempts > 0).length,
+        artifactsCreated: [...completedArtifacts.keys()],
+        artifactsFailed: [...failedArtifacts],
+      });
+
+      // ── Format final summary ───────────────────────────────
+      const completedCount = results.filter(
+        (r) =>
+          r.validation && !r.validation.isError && !r.validation.blockersFailed
+      ).length;
+      const skippedCount = results.filter((r) => r.output.startsWith("⏭️")).length;
+      const failedCount = results.filter(
+        (r) =>
+          r.validation?.isError ||
+          r.validation?.blockersFailed ||
+          r.output.startsWith("❌")
+      ).length;
+
+      const summaryHeader = [
+        `## Workflow: ${plan.name}`,
+        `**Squad:** ${params.squad} | **Steps:** ${plan.steps.length} | **Completed:** ${completedCount} | **Skipped:** ${skippedCount} | **Failed:** ${failedCount} | **Duration:** ${Math.round(totalDuration / 1000)}s`,
+        "",
+      ].join("\n");
+
+      const stepSummaries = results
+        .map((r) => {
+          const parallelNote =
+            r.parallelWith.length > 0
+              ? ` _(parallel with ${r.parallelWith.map((a) => a.split("--").pop()).join(", ")})_`
+              : "";
+
+          const taskInfo = plan.steps.find((s) => s.agent === r.agent);
+          const contractNote = taskInfo?.taskContract
+            ? `\n**Task:** ${taskInfo.taskContract.name} | **Outputs:** ${taskInfo.taskContract.outputs.map((o) => o.nome).join(", ") || "—"}`
+            : "";
+
+          const validationNote = r.validation
+            ? `\n**Validation:** ${r.validation.summary}`
+            : "";
+
+          const retryNote =
+            r.attempts > 1 ? `\n**Attempts:** ${r.attempts}` : "";
+
+          const durationNote =
+            r.durationMs > 0
+              ? `\n**Duration:** ${Math.round(r.durationMs / 1000)}s`
+              : "";
+
+          return `### Step ${r.step}: ${r.agent}${parallelNote}${contractNote}${validationNote}${retryNote}${durationNote}\n${r.output}`;
+        })
         .join("\n\n---\n\n");
 
       return {
-        content: [{ type: "text", text: finalSummary }],
+        content: [{ type: "text", text: summaryHeader + stepSummaries }],
         details: {
           squad: params.squad,
           workflow: params.workflow,
-          steps: chain.length,
-          agents: chain.map((s) => s.agent),
+          steps: plan.steps.length,
+          completed: completedCount,
+          skipped: skippedCount,
+          failed: failedCount,
+          durationMs: totalDuration,
+          agents: plan.steps.map((s) => s.agent),
+          artifacts: [...completedArtifacts.keys()],
+          failedArtifacts: [...failedArtifacts],
+          validations: results
+            .filter((r) => r.validation)
+            .map((r) => ({
+              agent: r.agentId,
+              ...r.validation,
+            })),
         },
       };
     },
   });
+
+  /**
+   * Execute a single workflow step with retry logic.
+   *
+   * Retry is controlled by the task's Error Handling config:
+   * - strategy: "retry" → retry up to maxAttempts
+   * - strategy: "fallback" → on failure, try fallback action
+   * - strategy: "abort" → fail immediately (default)
+   */
+  async function executeStepWithRetry(
+    step: WorkflowStep,
+    completedArtifacts: Map<string, string>,
+    initialContext: string,
+    squad: ParsedSquad,
+    cwd: string,
+    signal?: AbortSignal,
+    onUpdate?: (update: any) => void
+  ): Promise<{
+    step: WorkflowStep;
+    output: string;
+    validation: ReturnType<typeof validateStepOutput>;
+    attempts: number;
+    durationMs: number;
+  }> {
+    const maxAttempts = step.retryConfig.strategy === "retry"
+      ? Math.max(1, step.retryConfig.maxAttempts)
+      : 1;
+    const delayMs = parseDelay(step.retryConfig.delay);
+
+    let lastOutput = "";
+    let lastValidation: ReturnType<typeof validateStepOutput> | null = null;
+    const startTime = Date.now();
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      // Emit agent-start trigger
+      emitTrigger(squad, cwd, {
+        type: "agent-start",
+        agent: step.agentId,
+        attempt,
+        maxAttempts,
+        taskContract: step.taskContract?.name,
+      });
+
+      // Log pre-conditions
+      if (step.taskContract?.preConditions.length) {
+        onUpdate?.({
+          content: [
+            {
+              type: "text",
+              text: `[${step.agentId}] Pre-conditions: ${step.taskContract.preConditions.length} items` +
+                (attempt > 1 ? ` (attempt ${attempt}/${maxAttempts})` : ""),
+            },
+          ],
+        });
+      }
+
+      // Build task prompt with full contract
+      const prompt = buildTaskPrompt(
+        step,
+        completedArtifacts,
+        initialContext,
+        squad.manifest.name
+      );
+
+      // Execute
+      onUpdate?.({
+        content: [
+          {
+            type: "text",
+            text: `[${step.agentId}] Executing${attempt > 1 ? ` (retry ${attempt}/${maxAttempts})` : ""}...`,
+          },
+        ],
+      });
+
+      const output = await spawnSquadAgent(
+        step.agent,
+        prompt,
+        cwd,
+        signal,
+        (text) =>
+          onUpdate?.({
+            content: [
+              { type: "text", text: `[${step.agentId}] ${text.slice(0, 200)}...` },
+            ],
+          })
+      );
+
+      lastOutput = output;
+
+      // Validate against task contract
+      lastValidation = validateStepOutput(output, step.taskContract);
+
+      // Emit task-end trigger
+      const stepDuration = Date.now() - startTime;
+      emitTrigger(squad, cwd, {
+        type: "task-end",
+        agent: step.agentId,
+        attempt,
+        duration: `${Math.round(stepDuration / 1000)}s`,
+        validation: lastValidation.summary,
+        isError: lastValidation.isError,
+        blockersFailed: lastValidation.blockersFailed,
+      });
+
+      // Check if we should retry
+      if (!lastValidation.isError && !lastValidation.blockersFailed) {
+        // Success — no retry needed
+        return {
+          step,
+          output: lastOutput,
+          validation: lastValidation,
+          attempts: attempt,
+          durationMs: Date.now() - startTime,
+        };
+      }
+
+      // Failed — should we retry?
+      if (attempt < maxAttempts) {
+        onUpdate?.({
+          content: [
+            {
+              type: "text",
+              text: `[${step.agentId}] ⚠️ ${lastValidation.summary} — retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxAttempts})`,
+            },
+          ],
+        });
+        if (delayMs > 0) await sleep(delayMs);
+      }
+    }
+
+    // All attempts exhausted — try fallback if configured
+    if (step.retryConfig.strategy === "fallback" && step.retryConfig.fallback) {
+      onUpdate?.({
+        content: [
+          {
+            type: "text",
+            text: `[${step.agentId}] All attempts failed. Trying fallback: ${step.retryConfig.fallback}`,
+          },
+        ],
+      });
+
+      const fallbackPrompt = buildTaskPrompt(
+        { ...step, action: step.retryConfig.fallback },
+        completedArtifacts,
+        initialContext,
+        squad.manifest.name
+      );
+
+      const fallbackOutput = await spawnSquadAgent(
+        step.agent,
+        fallbackPrompt,
+        cwd,
+        signal
+      );
+
+      const fallbackValidation = validateStepOutput(fallbackOutput, step.taskContract);
+      return {
+        step,
+        output: fallbackOutput,
+        validation: fallbackValidation,
+        attempts: maxAttempts + 1,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    return {
+      step,
+      output: lastOutput,
+      validation: lastValidation!,
+      attempts: maxAttempts,
+      durationMs: Date.now() - startTime,
+    };
+  }
+
+  // ─── squad_inject ────────────────────────────────────────
 
   pi.registerTool({
     name: "squad_inject",
@@ -716,7 +1159,6 @@ export default function squadLoader(pi: ExtensionAPI) {
         }
 
         case "context": {
-          // Store as context that will be injected in next before_agent_start
           const contextDir = join(gsdDir, "squad-context");
           mkdirSync(contextDir, { recursive: true });
           const filename = params.label
@@ -744,6 +1186,8 @@ export default function squadLoader(pi: ExtensionAPI) {
     },
   });
 
+  // ─── squad_status ────────────────────────────────────────
+
   pi.registerTool({
     name: "squad_status",
     label: "Squad Status",
@@ -765,12 +1209,14 @@ export default function squadLoader(pi: ExtensionAPI) {
       const lines = ["Activated squads:\n"];
       for (const [name, agents] of state.activatedAgents) {
         const squad = state.loadedSquads.get(name);
-        lines.push(`  ${name} v${squad?.manifest.version || "?"}`);
+        const taskCount = squad?.tasks.length || 0;
+        const wfCount = squad?.workflows.length || 0;
+        lines.push(`  ${name} v${squad?.manifest.version || "?"} (${taskCount} tasks, ${wfCount} workflows)`);
         for (const a of agents) {
           const agent = squad?.agents.find(
             (ag) => `squad--${name}--${ag.id}` === a
           );
-          lines.push(`    ${agent?.icon || "•"} ${a}`);
+          lines.push(`    ${agent?.icon || "•"} ${a}: ${agent?.whenToUse || ""}`);
         }
       }
       return {
@@ -798,7 +1244,6 @@ export default function squadLoader(pi: ExtensionAPI) {
         { value: "status", label: "Show activated squads" },
       ];
 
-      // If prefix starts with a subcommand + space, complete squad names
       const parts = prefix.split(" ");
       if (parts.length >= 2 && ["activate", "agents", "run"].includes(parts[0])) {
         ensureDiscovered();
@@ -863,7 +1308,6 @@ export default function squadLoader(pi: ExtensionAPI) {
           ensureDiscovered();
           const result = activateSquad(name);
           ctx.ui.notify(result, "info");
-          // Reload so Pi discovers the new agent files
           await ctx.reload();
           break;
         }
@@ -882,7 +1326,6 @@ export default function squadLoader(pi: ExtensionAPI) {
             );
             return;
           }
-          // Prompt user for context/briefing
           const briefing = await ctx.ui.editor({
             title: `Briefing for ${workflowName}`,
             message: "Provide the initial context/briefing for this workflow:",
@@ -891,7 +1334,7 @@ export default function squadLoader(pi: ExtensionAPI) {
 
           pi.sendUserMessage(
             `Use the squad_workflow tool with squad="${squadName}", workflow="${workflowName}", context="${briefing}"`,
-            { mode: "steer" }
+            { deliverAs: "steer" }
           );
           break;
         }
@@ -905,7 +1348,7 @@ export default function squadLoader(pi: ExtensionAPI) {
           const targetType = (parts[2] || "research") as "research" | "decision" | "context";
           pi.sendUserMessage(
             `Use the squad_inject tool with artifactPath="${artifactPath}", targetType="${targetType}"`,
-            { mode: "steer" }
+            { deliverAs: "steer" }
           );
           break;
         }
@@ -935,14 +1378,8 @@ export default function squadLoader(pi: ExtensionAPI) {
     },
   });
 
-  // ─── Event Hooks ─────────────────────────────────────────
+  // ─── System Prompt Injection ─────────────────────────────
 
-  /**
-   * Inject squad operating rules into the agent's system prompt.
-   * Always injected (even with no squads active) so the agent knows the correct
-   * approach BEFORE it attempts any squad operation. When squads are already
-   * activated the section is extended with agent inventory.
-   */
   pi.on("before_agent_start", async (event, ctx) => {
     const sections: string[] = [
       "\n\n[SQUAD-LOADER — OPERATING RULES]",
@@ -1012,12 +1449,12 @@ export default function squadLoader(pi: ExtensionAPI) {
       );
     }
 
-    // Inject any squad-context files from .gsd/squad-context/
+    // Inject squad-context files
     const cwd = ctx.cwd || process.cwd();
     const contextDir = join(cwd, ".gsd", "squad-context");
     if (existsSync(contextDir)) {
       try {
-        const contextFiles = (await import("fs")).readdirSync(contextDir).filter(
+        const contextFiles = fs.readdirSync(contextDir).filter(
           (f: string) => f.endsWith(".md")
         );
         if (contextFiles.length > 0) {
@@ -1037,14 +1474,8 @@ export default function squadLoader(pi: ExtensionAPI) {
     };
   });
 
-  /**
-   * Auto-discover squads on startup
-   */
+  // Auto-discover on startup
   pi.on("session_start", async () => {
     state.manifests = discoverSquads(state.squadsDir);
-    if (state.manifests.length > 0) {
-      // Set status line showing available squads
-      // (ctx not available here, but we store for later use)
-    }
   });
 }
