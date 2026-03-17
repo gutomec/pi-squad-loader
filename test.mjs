@@ -148,7 +148,7 @@ assert(squadParsed.tags?.includes("testing"), "Tags parsed");
 
 console.log("\n── Test 3: Real Squad Discovery ──");
 
-const squadsDir = join(process.env.HOME || "", "squads");
+const squadsDir = join(process.env.HOME || process.env.USERPROFILE || "", "squads");
 if (existsSync(squadsDir)) {
   const entries = readdirSync(squadsDir);
   const squads = entries.filter((e) =>
