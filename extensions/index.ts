@@ -258,8 +258,9 @@ async function spawnSquadAgent(
     // NOTE: Prompt is NOT passed as a CLI arg anymore.
     // It's delivered via stdin to avoid ARG_MAX limits with large prompts.
 
+    const pathSep = process.platform === "win32" ? ";" : ":";
     const bundledPaths = (process.env.GSD_BUNDLED_EXTENSION_PATHS ?? "")
-      .split(":")
+      .split(pathSep)
       .filter(Boolean);
     const extensionArgs = bundledPaths.flatMap((p) => ["--extension", p]);
 
@@ -344,10 +345,14 @@ async function spawnSquadAgent(
 
     if (signal) {
       const kill = () => {
-        proc.kill("SIGTERM");
-        setTimeout(() => {
-          if (!proc.killed) proc.kill("SIGKILL");
-        }, 5000);
+        if (process.platform === "win32") {
+          proc.kill();
+        } else {
+          proc.kill("SIGTERM");
+          setTimeout(() => {
+            if (!proc.killed) proc.kill("SIGKILL");
+          }, 5000);
+        }
       };
       if (signal.aborted) kill();
       else signal.addEventListener("abort", kill, { once: true });
