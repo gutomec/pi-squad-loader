@@ -1,0 +1,11 @@
+name: test-v1-squad
+version: 1.0.0
+description: "A v1 test squad with no v2/v3 features"
+slashPrefix: tv1
+components:
+  agents:
+    - agent-alpha.md
+  tasks:
+    - task-alpha.md
+  workflows:
+    - basic-workflow.yaml

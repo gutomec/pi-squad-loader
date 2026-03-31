@@ -1,0 +1,40 @@
+name: test-v3-squad
+version: 3.0.0
+description: "A v3 test squad with harness engineering features"
+slashPrefix: tv3
+state:
+  enabled: true
+  storage: file
+  resume: true
+model_strategy:
+  orchestrator: "claude-sonnet-4"
+  workers: "gemini-flash"
+  reviewers: "claude-sonnet-4"
+  override: true
+harness:
+  doom_loop:
+    enabled: true
+    max_identical_outputs: 3
+    on_detect: abort
+  ralph_loop:
+    enabled: true
+    max_iterations: 5
+  context_compaction:
+    enabled: true
+    strategy: key-fields
+    max_handoff_tokens: 4000
+  filesystem_collaboration:
+    enabled: true
+    artifact_dir: artifacts
+  traces:
+    enabled: true
+    level: standard
+components:
+  agents:
+    - agent-gamma.md
+  tasks:
+    - task-gamma.md
+  workflows:
+    - v3-workflow.yaml
+  schemas:
+    - analysis.json

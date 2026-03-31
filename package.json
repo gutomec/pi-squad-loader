@@ -1,18 +1,32 @@
 {
-  "name": "pi-squad-loader",
-  "version": "1.0.0",
-  "description": "GSD-PI extension that loads Squads ecosystem agents as native Pi SDK subagents, enabling squad workflows within autonomous GSD execution.",
+  "name": "pi-squad-loader-v3",
+  "version": "3.0.0",
+  "description": "GSD-PI extension v3: Harness-engineered squad runtime with real validation gates, doom loop detection, Ralph Loop retry, filesystem collaboration, DAG execution, execution traces, and legibility scoring.",
   "author": "gutomec",
   "license": "MIT",
   "type": "module",
-  "keywords": ["pi-package", "pi-extension", "squads", "multi-agent", "gsd-pi"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "squads",
+    "multi-agent",
+    "gsd-pi",
+    "harness-engineering",
+    "validation-gates",
+    "doom-loop",
+    "ralph-loop"
+  ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/gutomec/pi-squad-loader"
+    "url": "https://github.com/gutomec/pi-squad-loader-v3"
   },
   "pi": {
-    "extensions": ["./extensions"],
-    "skills": ["./skills"]
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "files": [
     "extensions/",
@@ -21,14 +35,20 @@
     "README.md"
   ],
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
   },
   "dependencies": {
+    "ajv": "^8.17.0",
+    "glob": "^10.3.0",
     "gray-matter": "^4.0.3",
-    "js-yaml": "^4.1.0",
-    "glob": "^10.3.0"
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^25.5.0",
+    "typescript": "^6.0.2"
   }
 }
