@@ -1,10 +1,12 @@
-# pi-squad-loader-v3 ⚡
+# pi-squad-loader ⚡
 
 > GSD-PI extension v3: Harness-engineered squad runtime with real validation gates, doom loop detection, Ralph Loop retry, filesystem collaboration, DAG execution, execution traces, and context compaction.
 
 ## What is this?
 
-A [GSD-PI](https://github.com/mariozechner/pi-coding-agent) extension that adds squad management tools to Pi. Load, activate, dispatch, and run multi-agent squads with full v3 harness engineering.
+A [GSD-2](https://github.com/gsd-build/GSD-2) extension that adds squad management tools to Pi. Load, activate, dispatch, and run multi-agent squads with full v3 harness engineering.
+
+**Key difference from v1/v2:** Zero configuration! Auto-detects GSD installation and squad directories on any OS (macOS, Linux, Windows).
 
 ## What's New in v3
 
@@ -24,15 +26,34 @@ A [GSD-PI](https://github.com/mariozechner/pi-coding-agent) extension that adds 
 
 ## Installation
 
-```bash
-# As a Pi package
-pi install pi-squad-loader-v3
+Installed automatically with [GSD-2](https://github.com/gsd-build/GSD-2). No manual setup needed!
 
-# Or clone and link
-git clone https://github.com/gutomec/pi-squad-loader-v3
-cd pi-squad-loader-v3
+```bash
+# GSD-2 installation (includes pi-squad-loader)
+git clone https://github.com/gsd-build/GSD-2
+cd GSD-2
 npm install
+gsd --version  # Verify installation
 ```
+
+## Auto-Discovery (Zero Configuration!)
+
+**Nothing to configure.** The loader automatically:
+
+### 1. Finds GSD executable
+- **macOS:** `/opt/homebrew/bin/gsd`, `/usr/local/bin/gsd`
+- **Linux:** `/usr/local/bin/gsd`, `/usr/bin/gsd`, `~/.local/bin/gsd`
+- **Windows:** `C:\Program Files\GSD\gsd.exe`, etc.
+- **Fallback:** Searches PATH if not in standard locations
+
+### 2. Discovers squad directories
+Searches in this order (all platforms):
+1. Global user: `~/.squads`
+2. Global GSD: `~/.gsd/squads`
+3. Project-local: `.squads/`
+4. Project GSD: `.gsd/squads/`
+
+Return only directories that exist. Deduplicates squads by name.
 
 ## Pi Tools Provided
 
@@ -54,14 +75,15 @@ npm install
 ## Architecture
 
 ```
-extensions/index.ts     — Pi extension entry point, tool registration (1151 loc)
-lib/squad-parser.ts     — YAML parser for v1/v2/v3 manifests (716 loc)
-lib/validation.ts       — Real validation engine with ajv (267 loc)
-lib/v3-runtime.ts       — Runtime: state, checkpoints, artifacts, traces (499 loc)
-lib/agent-adapter.ts    — Agent → Pi SDK adapter (443 loc)
+extensions/index.ts       — Pi extension entry point, tool registration
+lib/path-resolver.ts      — Auto-detection of GSD binary and squad dirs (NEW!)
+lib/squad-parser.ts       — YAML parser for v1/v2/v3 manifests
+lib/validation.ts         — Real validation engine with ajv
+lib/v3-runtime.ts         — Runtime: state, checkpoints, artifacts, traces
+lib/agent-adapter.ts      — Agent → Pi SDK adapter
 ```
 
-Total: ~3,076 lines of TypeScript.
+Key feature: `path-resolver.ts` handles all OS-specific path logic so users never need environment variables.
 
 ## Version Detection
 

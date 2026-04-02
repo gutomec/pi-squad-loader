@@ -42,6 +42,10 @@ import {
   executeValidation, extractJson, buildRetryPrompt, formatValidationSummary,
   type ValidationResult,
 } from "../lib/validation.js";
+import {
+  findGsdBinary, findSquadDirectories, getAgentsCacheDir, getStateDir,
+  verifyGsdInstallation,
+} from "../lib/path-resolver.js";
 
 // ─── Result Helpers ──────────────────────────────────────────
 // Pi SDK requires specific return shape. These helpers ensure type safety.
@@ -76,7 +80,24 @@ const state: LoaderState = {
 
 function ensureDiscovered(): boolean {
   if (state.manifests.length === 0) {
-    state.manifests = discoverSquads(state.squadsDir);
+    // Discover squads from all configured directories
+    const squadsDirectories = findSquadDirectories();
+    const allManifests: SquadManifest[] = [];
+    const seenNames = new Set<string>();
+
+    for (const dir of squadsDirectories) {
+      if (existsSync(dir)) {
+        const manifests = discoverSquads(dir);
+        for (const m of manifests) {
+          if (!seenNames.has(m.name)) {
+            allManifests.push(m);
+            seenNames.add(m.name);
+          }
+        }
+      }
+    }
+
+    state.manifests = allManifests;
   }
   return state.manifests.length > 0;
 }
@@ -183,6 +204,13 @@ function spawnAgent(
   if (!existsSync(agentPath)) return Promise.resolve(`(agent ${agentName} not found)`);
 
   return new Promise<string>((resolve) => {
+    const gsdBin = findGsdBinary();
+    if (!gsdBin) {
+      return resolve(
+        `(GSD binary not found. Install GSD-2 from https://github.com/gsd-build/GSD-2)`
+      );
+    }
+
     let agentModel: string | undefined = modelOverride;
     let agentTools: string[] = [];
     let agentSystemPrompt = "";
@@ -225,8 +253,8 @@ function spawnAgent(
     const extensionArgs = slimPaths.flatMap(p => ["--extension", p]);
 
     const proc = spawn(
-      process.execPath,
-      [process.env.GSD_BIN_PATH!, ...extensionArgs, ...args],
+      gsdBin,
+      [...extensionArgs, ...args],
       { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] }
     );
 
@@ -292,9 +320,18 @@ function spawnAgent(
 // ─── Extension Entry Point ───────────────────────────────────
 
 export default function squadLoaderV3(pi: ExtensionAPI) {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+  // Auto-detect GSD installation and paths (cross-platform, no config needed)
+  const gsdCheck = verifyGsdInstallation();
+  if (!gsdCheck.available) {
+    console.warn(`[pi-squad-loader] ${gsdCheck.error}`);
+  }
+
+  // Use primary global squads directory for listing/display
+  const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
   state.squadsDir = resolve(homeDir, "squads");
-  state.agentsCacheDir = resolve(homeDir, ".gsd", "agent", "agents");
+
+  // Use auto-detected agent cache
+  state.agentsCacheDir = getAgentsCacheDir();
   if (!existsSync(state.agentsCacheDir)) mkdirSync(state.agentsCacheDir, { recursive: true });
 
   // ═══════════════════════════════════════════════════════════
@@ -304,11 +341,12 @@ export default function squadLoaderV3(pi: ExtensionAPI) {
   pi.registerTool({
     name: "squad_list",
     label: "Squad List",
-    description: "List all available squads from ~/squads/. Shows v1/v2/v3 status and features.",
+    description: "List all available squads from ~/squads, ~/.gsd/squads, and project-local .squads/. Shows v1/v2/v3 status and features. Auto-discovers on macOS, Linux, Windows.",
     promptSnippet: "List available squads and their agents",
     promptGuidelines: [
       "Use this tool to discover what squads are available before activating them",
       "Shows squad name, version, v1/v2/v3 status, agent count, and activation status",
+      "Searches global user directories and project-local directories automatically",
     ],
     parameters: Type.Object({
       filter: Type.Optional(Type.String({ description: "Filter squads by name or tag" })),
