@@ -1,5 +1,5 @@
 {
-  "name": "pi-squad-loader-v3",
+  "name": "pi-squad-loader",
   "version": "3.0.0",
   "description": "GSD-PI extension v3: Harness-engineered squad runtime with real validation gates, doom loop detection, Ralph Loop retry, filesystem collaboration, DAG execution, execution traces, and legibility scoring.",
   "author": "gutomec",
